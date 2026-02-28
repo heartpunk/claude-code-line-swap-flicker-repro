@@ -7,3 +7,5 @@ mutants/
 flicker.db
 .venv/
 uv.lock
+analyze-flicker.py
+FALSE_POSITIVE_ANALYSIS.md
