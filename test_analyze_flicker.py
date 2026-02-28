@@ -35,6 +35,8 @@ ensure_session_schema = _mod.ensure_session_schema
 ensure_thinking_schema = _mod.ensure_thinking_schema
 backfill_thinking_above = _mod.backfill_thinking_above
 thinking_stats_report = _mod.thinking_stats_report
+_strip_ansi = _mod._strip_ansi
+detect_welcome_screen = _mod.detect_welcome_screen
 WINDOW_SIZE = _mod.WINDOW_SIZE
 MIN_SYNC_BLOCKS = _mod.MIN_SYNC_BLOCKS
 SMALL_CUP_MAX = _mod.SMALL_CUP_MAX
@@ -2460,3 +2462,348 @@ class TestSchemaAdditional:
             "PRAGMA index_list(claude_sessions)"
         ).fetchall()]
         assert 'idx_sessions_recording' in indexes
+
+
+# ── _strip_ansi tests ─────────────────────────────────────────────────────
+
+class TestStripAnsi:
+    """Tests for _strip_ansi — normalises tmux literal ESC and strips ANSI sequences."""
+
+    def test_strips_raw_esc_csi(self):
+        """Raw ESC CSI sequences are removed."""
+        raw = b'\x1b[31mRed text\x1b[0m'
+        assert _strip_ansi(raw) == b'Red text'
+
+    def test_strips_tmux_literal_csi(self):
+        """tmux literal \\033 CSI sequences are normalised then removed."""
+        tmux = b'\\033[31mRed text\\033[0m'
+        assert _strip_ansi(tmux) == b'Red text'
+
+    def test_preserves_content(self):
+        """Non-escape content is preserved unchanged."""
+        plain = b'Hello, world!'
+        assert _strip_ansi(plain) == b'Hello, world!'
+
+    def test_strips_osc_sequence(self):
+        """OSC (Operating System Command) sequences are removed."""
+        osc = b'\x1b]0;window title\x07some text'
+        assert _strip_ansi(osc) == b'some text'
+
+    def test_strips_tmux_literal_osc(self):
+        """tmux literal \\033 OSC sequences are removed."""
+        osc = b'\\033]0;window title\x07some text'
+        assert _strip_ansi(osc) == b'some text'
+
+    def test_empty_input(self):
+        """Empty payload returns empty bytes."""
+        assert _strip_ansi(b'') == b''
+
+    def test_mixed_raw_and_literal(self):
+        """Payload with both raw ESC and literal \\033 sequences."""
+        mixed = b'\x1b[1mBold\\033[0m normal'
+        result = _strip_ansi(mixed)
+        assert result == b'Bold normal'
+
+
+# ── detect_welcome_screen tests ──────────────────────────────────────────────
+
+class TestDetectWelcomeScreen:
+    """Tests for detect_welcome_screen — structural Claude Code welcome screen detector."""
+
+    def test_full_welcome_box_detected(self):
+        """Full welcome box with Claude Code text, version, and logo is detected."""
+        payload = (
+            b'\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80'  # ╭───
+            b'Claude Code v2.1.62'
+            b'\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xae'  # ───╮
+            b'\n  Welcome back Alice!  \n'
+            b'  \xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c  \n'  # ▐▛███▜▌
+            b'  Opus 4.6 \xc2\xb7 Claude Max  \n'
+            b'\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf'  # ╰──────╯
+        )
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is True
+        assert result['version'] == '2.1.62'
+        assert 'claude_code_text' in result['signals']
+        assert 'version_tag' in result['signals']
+        assert result['score'] >= 3
+
+    def test_compact_resume_view_detected(self):
+        """Compact resume view with logo + version is detected."""
+        payload = (
+            b'  \xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c   '
+            b'Claude Code v2.1.62\n'
+            b'  \xe2\x96\x9d\xe2\x96\x9c\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9b\xe2\x96\x98  '
+            b'Opus 4.6 \xc2\xb7 Claude Max\n'
+        )
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is True
+        assert result['version'] == '2.1.62'
+        assert 'claude_logo' in result['signals']
+
+    def test_logo_only_not_detected(self):
+        """Logo characters alone without any other signals → not detected."""
+        payload = b'\xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c'  # ▐▛█▜▌
+        result = detect_welcome_screen(payload)
+        # Only 1 signal (claude_logo), needs 3 for non-core detection
+        assert result['detected'] is False
+
+    def test_plain_text_negative(self):
+        """Plain text with no Claude Code signals → not detected."""
+        payload = b'This is just regular terminal output with no special patterns.'
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is False
+        assert result['score'] == 0
+        assert result['signals'] == []
+
+    def test_version_extraction_with_ansi(self):
+        """Version is extracted even when surrounded by ANSI escape sequences."""
+        # Raw ESC codes around the version text
+        payload = b'\x1b[1m\x1b[36mClaude Code v3.0.1\x1b[0m  some output'
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is True  # core (claude_code_text + version_tag)
+        assert result['version'] == '3.0.1'
+
+    def test_version_extraction_tmux_literal(self):
+        """Version is extracted from tmux literal \\033 encoded payloads."""
+        payload = b'\\033[1m\\033[36mClaude Code v2.1.62\\033[0m more text'
+        result = detect_welcome_screen(payload)
+        assert result['version'] == '2.1.62'
+        assert result['detected'] is True
+
+    def test_model_info_signal(self):
+        """Model info (Opus 4.6) triggers model_info signal."""
+        payload = b'Claude Code v1.0.0\n  Opus 4.6 session'
+        result = detect_welcome_screen(payload)
+        assert 'model_info' in result['signals']
+
+    def test_sonnet_model_info(self):
+        """Sonnet model name is also detected."""
+        payload = b'Claude Code v1.0.0\n  Sonnet 4.6'
+        result = detect_welcome_screen(payload)
+        assert 'model_info' in result['signals']
+
+    def test_haiku_model_info(self):
+        """Haiku model name is also detected."""
+        payload = b'Claude Code v1.0.0\n  Haiku 4.5'
+        result = detect_welcome_screen(payload)
+        assert 'model_info' in result['signals']
+
+    def test_welcome_text_signal(self):
+        """'Welcome back' text triggers welcome_text signal."""
+        payload = b'Claude Code v1.0.0\nWelcome back Alice!'
+        result = detect_welcome_screen(payload)
+        assert 'welcome_text' in result['signals']
+
+    def test_sandbox_msg_signal(self):
+        """'sandboxed' text triggers sandbox_msg signal."""
+        payload = b'Claude Code v1.0.0\nYour bash commands will be sandboxed.'
+        result = detect_welcome_screen(payload)
+        assert 'sandbox_msg' in result['signals']
+
+    def test_token_counter_signal(self):
+        """'tokens' text triggers token_counter signal."""
+        payload = b'Claude Code v1.0.0\n  0 tokens'
+        result = detect_welcome_screen(payload)
+        assert 'token_counter' in result['signals']
+
+    def test_terminal_title_raw_detected(self):
+        """OSC terminal title with Claude Code is detected (raw ESC)."""
+        payload = b'\x1b]0;\xe2\x9c\xb3 Claude Code\x07some output'
+        result = detect_welcome_screen(payload)
+        assert 'terminal_title' in result['signals']
+
+    def test_terminal_title_tmux_literal_detected(self):
+        """OSC terminal title with Claude Code is detected (tmux literal)."""
+        payload = b'\\033]0;Claude Code\x07some output'
+        result = detect_welcome_screen(payload)
+        assert 'terminal_title' in result['signals']
+
+    def test_resume_session_signal(self):
+        """'Resume Session' text triggers resume_session signal."""
+        payload = b'Claude Code v1.0.0\nResume Session from earlier'
+        result = detect_welcome_screen(payload)
+        assert 'resume_session' in result['signals']
+
+    def test_caskroom_path_not_detected(self):
+        """Homebrew Caskroom path should NOT trigger welcome screen detection."""
+        payload = b'/opt/homebrew/Caskroom/claude-code/2.1.34/claude --resume abc'
+        result = detect_welcome_screen(payload)
+        # This has "claude" and "code" but within a file path — the version_tag
+        # might match, but the structural scoring should be low
+        # The key thing: version should NOT be 2.1.34 from path
+        # (It may or may not detect, but it shouldn't have high confidence)
+        assert result['score'] <= 2
+
+    def test_return_keys_present(self):
+        """Result dict always has all expected keys."""
+        result = detect_welcome_screen(b'nothing here')
+        assert 'detected' in result
+        assert 'version' in result
+        assert 'score' in result
+        assert 'signals' in result
+
+    def test_empty_payload(self):
+        """Empty payload → not detected."""
+        result = detect_welcome_screen(b'')
+        assert result['detected'] is False
+        assert result['version'] is None
+        assert result['score'] == 0
+
+    def test_box_header_signal(self):
+        """Box drawing characters (╭───) trigger box_header signal."""
+        payload = (
+            b'Claude Code v1.0.0\n'
+            b'\xe2\x95\xad\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80'  # ╭─────
+        )
+        result = detect_welcome_screen(payload)
+        assert 'box_header' in result['signals']
+
+    def test_box_footer_signal(self):
+        """Box drawing characters (╰───╯) trigger box_footer signal."""
+        payload = (
+            b'Claude Code v1.0.0\n'
+            b'\xe2\x95\xb0\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xaf'  # ╰───╯
+        )
+        result = detect_welcome_screen(payload)
+        assert 'box_footer' in result['signals']
+
+    def test_three_supporting_signals_enough(self):
+        """≥3 supporting signals without any core signal → detected."""
+        # welcome_text + sandbox_msg + token_counter = 3 supporting signals
+        # No "Claude Code" text or version tag
+        payload = b'Welcome back Alice!\nYour commands will be sandboxed.\n  0 tokens remaining'
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is True
+        assert result['score'] >= 3
+
+    def test_one_core_plus_one_supporting_detected(self):
+        """1 core + 1 supporting signal → detected."""
+        # claude_code_text (core) + welcome_text (supporting)
+        payload = b'Claude Code startup\nWelcome back Bob!'
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is True
+        assert 'claude_code_text' in result['signals']
+        assert 'welcome_text' in result['signals']
+
+    def test_one_core_alone_not_detected(self):
+        """1 core signal alone (no supporting) → not detected."""
+        # Only claude_code_text, nothing else
+        payload = b'Claude Code'
+        result = detect_welcome_screen(payload)
+        assert result['detected'] is False
+
+
+# ── extract_features with is_welcome_screen ──────────────────────────────────
+
+class TestExtractFeaturesWelcomeScreen:
+    """Tests for is_welcome_screen field in extract_features."""
+
+    def test_welcome_screen_sets_flag(self):
+        """Welcome screen payload sets is_welcome_screen=True in features."""
+        payload = (
+            b'\xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c   '
+            b'Claude Code v2.1.62\n'
+            b'  Opus 4.6 \xc2\xb7 Claude Max\n'
+        )
+        feat = extract_features(make_frame(payload))
+        assert feat['is_welcome_screen'] is True
+        assert feat['version'] == '2.1.62'
+
+    def test_non_welcome_screen_clears_flag(self):
+        """Regular payload has is_welcome_screen=False."""
+        feat = extract_features(make_frame(b'regular terminal output'))
+        assert feat['is_welcome_screen'] is False
+
+    def test_welcome_version_preferred_over_caskroom(self):
+        """Welcome screen version is preferred over VERSION_RE Caskroom path match."""
+        payload = (
+            b'Claude Code v3.0.0\n'
+            b'Welcome back!\n'
+            b'/opt/homebrew/Caskroom/claude-code/2.1.34/claude'
+        )
+        feat = extract_features(make_frame(payload))
+        # The welcome screen detector should find v3.0.0 first
+        assert feat['version'] == '3.0.0'
+
+    def test_fallback_to_version_re(self):
+        """When welcome screen has no version, VERSION_RE is used as fallback."""
+        payload = b'claude-code/2.1.34 startup'
+        feat = extract_features(make_frame(payload))
+        assert feat['version'] == '2.1.34'
+        assert feat['is_welcome_screen'] is False
+
+    def test_fallback_to_version_re_second_alternation(self):
+        """VERSION_RE fallback works for claude/X.Y.Z pattern (second alternation)."""
+        payload = b'claude/4.5.6 process'
+        feat = extract_features(make_frame(payload))
+        assert feat['version'] == '4.5.6'
+        assert feat['is_welcome_screen'] is False
+
+
+# ── Session detection with new patterns ──────────────────────────────────────
+
+class TestSessionDetectionNewPatterns:
+    """Tests for session detection with welcome screen and resume goodbye patterns."""
+
+    def _write_ttyrec(self, payloads: list, ts_step_ms: int = 100) -> str:
+        data = b""
+        for i, p in enumerate(payloads):
+            sec = 1 + (i * ts_step_ms) // 1000
+            usec = ((i * ts_step_ms) % 1000) * 1000
+            data += struct.pack("<III", sec, usec, len(p)) + p
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_structural_welcome_detected_as_session(self):
+        """Structural welcome screen (logo + Claude Code text + version) → session with high confidence."""
+        payload = (
+            b'\\033[?2026h'
+            b'\xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c   '
+            b'Claude Code v2.1.62\n'
+            b'  Opus 4.6 \xc2\xb7 Claude Max\n'
+        )
+        path = self._write_ttyrec([payload])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            s = sessions[0]
+            assert s['confidence'] >= 5
+            assert s['claude_version'] == '2.1.62'
+        finally:
+            os.unlink(path)
+
+    def test_resume_goodbye_detected(self):
+        """'Resume this session with: claude --resume <id>' triggers goodbye."""
+        path = self._write_ttyrec([
+            b'\\033[?2026h Claude Code v2.1.62\n'
+            b'  \xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c  \n'
+            b'  Opus 4.6\n',
+            b'Resume this session with:\nclaude --resume abc-123',
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            s = sessions[0]
+            # Version + welcome → 8, + goodbye → min(8+5, 10) = 10
+            assert s['confidence'] >= 8
+            assert s['end_frame'] == 1  # goodbye on frame 1
+        finally:
+            os.unlink(path)
+
+    def test_welcome_back_text_in_welcome_screen(self):
+        """'Welcome back' inside a structural welcome screen triggers welcome signal."""
+        payload = (
+            b'Claude Code v2.1.62\n'
+            b'Welcome back Alice!\n'
+            b'  \xe2\x96\x90\xe2\x96\x9b\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88\xe2\x96\x9c\xe2\x96\x8c  \n'
+        )
+        path = self._write_ttyrec([payload])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['confidence'] >= 5
+        finally:
+            os.unlink(path)

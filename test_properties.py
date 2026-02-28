@@ -325,7 +325,8 @@ class TestMonotonicity:
 # ── Property 3: extract_features consistency ─────────────────────────────────
 
 EXPECTED_KEYS = frozenset({'ts', 'sync_count', 'cup_values', 'clear_count',
-                            'is_compact', 'pane_id', 'version', 'geom'})
+                            'is_compact', 'pane_id', 'version', 'geom',
+                            'is_welcome_screen'})
 
 
 class TestExtractFeaturesConsistency:

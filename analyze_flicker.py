@@ -69,6 +69,147 @@ GEOM_RAW = re.compile(b'\x1b' + rb'\[8;(\d+);(\d+)t')   # actual ESC byte form
 # Session boundary patterns
 WELCOME_RE = re.compile(rb'Welcome\s+to\s+Claude\s+Code', re.IGNORECASE)
 GOODBYE_RE = re.compile(rb'Goodbye\s+from\s+Claude\s+Code', re.IGNORECASE)
+RESUME_RE = re.compile(rb'Resume\s+this\s+session\s+with.*?claude\s+--resume', re.IGNORECASE | re.DOTALL)
+
+# Terminal title (OSC 0 / OSC 2) containing "Claude Code"
+# Raw: \x1b]0;...Claude Code...\x07  or literal: \033]0;...Claude Code...\x07
+OSC_TITLE_LIT = re.compile(rb'\\033\][02];[^\x07]*Claude\s*Code', re.IGNORECASE)
+OSC_TITLE_RAW = re.compile(b'\x1b' + rb'\][02];[^\x07]*Claude\s*Code', re.IGNORECASE)
+
+# ── Welcome screen structural signals ───────────────────────────────────────
+
+# ANSI stripping: CSI sequences (\x1b[...X) and OSC sequences (\x1b]...BEL/ST)
+_ANSI_CSI = re.compile(b'\x1b\\[[0-9;]*[A-Za-z]')
+_ANSI_OSC = re.compile(b'\x1b\\][^\x07]*(?:\x07|\x1b\\\\)')
+# tmux literal \033 (4 bytes: 0x5C 0x30 0x33 0x33) that encodes ESC
+_TMUX_LIT_ESC = re.compile(rb'\\033')
+
+# Block art characters used in the Claude logo
+_LOGO_CHARS = set('▐▛█▜▌▝▘'.encode('utf-8'))
+_LOGO_CHARS_BYTES = '▐▛█▜▌▝▘'.encode('utf-8')
+
+# Version tag near "Claude Code" text
+_WELCOME_VERSION_RE = re.compile(rb'v(\d+\.\d+\.\d+)')
+
+
+def _strip_ansi(payload: bytes) -> bytes:
+    """Strip ANSI escape sequences from payload.
+
+    Normalises tmux literal ``\\033`` encoding to raw ESC first, then removes
+    CSI and OSC sequences, returning printable content.
+    """
+    # Normalise tmux literal \033 → raw ESC byte
+    normalised = _TMUX_LIT_ESC.sub(b'\x1b', payload)
+    # Strip CSI sequences
+    normalised = _ANSI_CSI.sub(b'', normalised)
+    # Strip OSC sequences
+    normalised = _ANSI_OSC.sub(b'', normalised)
+    return normalised
+
+
+def detect_welcome_screen(payload: bytes) -> dict:
+    """Detect whether *payload* contains a Claude Code welcome screen.
+
+    Returns ``{'detected': bool, 'version': str|None, 'score': int, 'signals': list[str]}``.
+
+    Detection logic:
+        * ≥1 **core** signal + ≥1 other signal, OR
+        * ≥3 **supporting** signals.
+    """
+    stripped = _strip_ansi(payload)
+    signals: list[str] = []
+    version: str | None = None
+
+    # ── core signals ─────────────────────────────────────────────────────
+    # claude_code_text: "Claude" + "Code" within ~80 bytes (stripped text)
+    has_claude_code_text = False
+    claude_pos = stripped.lower().find(b'claude')
+    if claude_pos >= 0:
+        search_end = min(claude_pos + 80, len(stripped))
+        if b'code' in stripped[claude_pos:search_end].lower():
+            has_claude_code_text = True
+            signals.append('claude_code_text')
+
+    # version_tag: vX.Y.Z near "Claude Code" text
+    if has_claude_code_text:
+        # Search within a wider region around the "Claude" text in the raw payload
+        # (normalise tmux literal ESC but don't strip CSI — version may be inside
+        # an escape-decorated region like \033[1mClaude Code v2.1.62\033[0m)
+        raw_normalised = _TMUX_LIT_ESC.sub(b'\x1b', payload)
+        search_start = max(0, claude_pos - 50)
+        search_end = min(claude_pos + 150, len(raw_normalised))
+        vm = _WELCOME_VERSION_RE.search(raw_normalised[search_start:search_end])
+        if vm:
+            version = vm.group(1).decode('ascii', errors='replace')
+            signals.append('version_tag')
+
+    core_count = sum(1 for s in signals if s in ('claude_code_text', 'version_tag'))
+
+    # ── strong signals ───────────────────────────────────────────────────
+    # claude_logo: ≥3 distinct block art characters in the payload
+    logo_char_count = 0
+    for ch in _LOGO_CHARS_BYTES:
+        byte_val = bytes([ch])
+        if byte_val in payload:
+            logo_char_count += 1
+    if logo_char_count >= 3:
+        signals.append('claude_logo')
+
+    # terminal_title: OSC title containing "Claude Code"
+    if OSC_TITLE_LIT.search(payload) or OSC_TITLE_RAW.search(payload):
+        signals.append('terminal_title')
+
+    # ── supporting signals ───────────────────────────────────────────────
+    stripped_lower = stripped.lower()
+
+    # model_info: model name + version number
+    if (b'opus' in stripped_lower or b'sonnet' in stripped_lower or b'haiku' in stripped_lower):
+        if re.search(rb'\d+\.\d+', stripped):
+            signals.append('model_info')
+
+    # welcome_text
+    if b'welcome back' in stripped_lower or b'welcome to' in stripped_lower:
+        signals.append('welcome_text')
+
+    # resume_session
+    if b'resume session' in stripped_lower:
+        signals.append('resume_session')
+
+    # box_header / box_footer (UTF-8: ╭=e2 95 ad, ─=e2 94 80, ╰=e2 95 b0, ╯=e2 95 af)
+    _BOX_DASH = b'\xe2\x94\x80'
+    if b'\xe2\x95\xad' in stripped and stripped.count(_BOX_DASH) >= 3:
+        signals.append('box_header')
+    if b'\xe2\x95\xb0' in stripped and b'\xe2\x95\xaf' in stripped and stripped.count(_BOX_DASH) >= 3:
+        signals.append('box_footer')
+
+    # sandbox_msg
+    if b'sandboxed' in stripped_lower or b'/sandbox' in stripped_lower:
+        signals.append('sandbox_msg')
+
+    # token_counter: "tokens" in status context
+    if b'tokens' in stripped_lower:
+        signals.append('token_counter')
+
+    # ── scoring ──────────────────────────────────────────────────────────
+    score = len(signals)
+    other_count = score - 1  # signals beyond the first one (any type)
+
+    detected = False
+    if core_count >= 1 and other_count >= 1:
+        detected = True
+    elif score >= 3:
+        detected = True
+
+    return {
+        'detected': detected,
+        'version': version,
+        'score': score,
+        'signals': signals,
+    }
+
+
+# Frozen negative result for the smoke test fast path (tuple signals = immutable)
+_WELCOME_NEGATIVE = {'detected': False, 'version': None, 'score': 0, 'signals': ()}
 
 
 # ── Streaming parser ─────────────────────────────────────────────────────────
@@ -131,14 +272,23 @@ def extract_features(frame: dict) -> dict:
     pm = PANE_RE.match(p)
     pane_id = int(pm.group(1)) if pm else -1
 
-    # Claude version
-    vm = VERSION_RE.search(p)
-    version = None
-    if vm:
-        for g in vm.groups():
-            if g:
-                version = g.decode('ascii', errors='replace')
-                break
+    # Welcome screen detector (structural) — cheap smoke test first.
+    # "laude" covers Claude/claude/CLAUDE; skip the expensive detector on 99%+ of frames.
+    p_lower = p.lower()
+    if b'laude' in p_lower:
+        welcome = detect_welcome_screen(p)
+    else:
+        welcome = _WELCOME_NEGATIVE
+
+    is_welcome_screen = welcome['detected']
+
+    # Claude version: prefer welcome screen version over VERSION_RE (Caskroom path)
+    version = welcome['version']
+    if version is None:
+        vm = VERSION_RE.search(p)
+        if vm:
+            # VERSION_RE has two alternations; exactly one group is non-None per match
+            version = next(g for g in vm.groups() if g).decode('ascii', errors='replace')
 
     # Terminal geometry
     gm = GEOM_LIT.search(p) or GEOM_RAW.search(p)
@@ -153,6 +303,7 @@ def extract_features(frame: dict) -> dict:
         'pane_id': pane_id,
         'version': version,
         'geom': geom,
+        'is_welcome_screen': is_welcome_screen,
     }
 
 
@@ -539,6 +690,7 @@ def detect_sessions_in_recording(path: str) -> list:
         for frame in stream_frames(path):
             feat = extract_features(frame)
             p = frame['payload']
+            p_lower = p.lower()
             ts = feat['ts']
 
             frame_confidence = 0
@@ -560,14 +712,18 @@ def detect_sessions_in_recording(path: str) -> list:
                 if first_version is None:
                     first_version = feat['version']
 
-            if WELCOME_RE.search(p):
+            # Welcome screen: structural detector (preferred) or legacy regex
+            if feat.get('is_welcome_screen') or (b'laude' in p_lower and WELCOME_RE.search(p)):
                 frame_confidence = max(frame_confidence, 5)
                 frame_signal = 'welcome'
                 saw_welcome = True
 
-            if GOODBYE_RE.search(p):
-                goodbye_frame = frame_count
-                goodbye_ts = ts
+            # Goodbye: legacy regex or new "Resume this session" pattern
+            # Smoke test: skip regex if no relevant keywords present
+            if b'oodbye' in p_lower or b'esume' in p_lower:
+                if GOODBYE_RE.search(p) or RESUME_RE.search(p):
+                    goodbye_frame = frame_count
+                    goodbye_ts = ts
 
             if frame_signal is not None:
                 if first_claude_frame is None:
