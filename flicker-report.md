@@ -291,7 +291,7 @@ render pattern.
 - Heuristic tuned against a reference 47-minute session (`df3cbab2-...`) with a typed
   marker string to locate the compaction region precisely
 - Spot-checked with `ipbt` frame-by-frame visual rendering
-- Test suite: 138 unit + property tests (Hypothesis), 93.4% mutation kill rate (mutmut)
+- Test suite: 194 tests (173 unit/integration + 21 Hypothesis property tests), 83.4% mutation kill rate (mutmut 3.x, 668/801 mutants killed)
 
 ---
 

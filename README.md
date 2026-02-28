@@ -14,7 +14,7 @@ context compaction, lines ~3 rows below the compaction spinner visually reorder
 |---|---|
 | `analyze_flicker.py` | Streaming ttyrec parser + SQLite flicker detector |
 | `flicker-report.md` | Full analysis report with corpus stats and fix suggestions |
-| `test_analyze_flicker.py` | Unit + integration tests (99 tests) |
+| `test_analyze_flicker.py` | Unit + integration tests (173 tests) |
 | `test_properties.py` | Property-based tests (Hypothesis) |
 | `conftest.py` | Hypothesis profile config |
 | `pyproject.py` | Project deps and mutmut config |
