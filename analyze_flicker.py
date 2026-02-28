@@ -186,15 +186,10 @@ def meets_flicker_heuristics(
     if t1 - t0 > MAX_WINDOW_SECS:
         return False
 
-    # Compact lookback: is there a compaction event in recent history?
-    in_compact_window = any(
-        (frame_idx - ci) <= COMPACT_LOOKBACK
-        for ci in compact_history
-    )
-    if not in_compact_window:
-        return False
-
     # Aggregate signals across all frames in window
+    # NOTE: compaction context is tracked for metadata only (compaction_above field),
+    # but is NOT required — the flicker pattern can occur in any context where
+    # Claude Code is rendering queued messages, not just during compaction.
     total_sync = 0
     small_cup = 0
     large_cup = 0
@@ -268,10 +263,6 @@ def extract_event_metadata(
             nearest_compact_idx = ci
 
     compaction_above = nearest_compact_dist is not None
-
-    # payload sample
-    first_feat = frames[0][1] if frames else None
-    payload_sample = None
 
     return {
         'start_frame': start_idx,
@@ -582,7 +573,10 @@ def main():
     conn = init_db(args.db)
 
     if args.query_only:
-        run_analysis_queries(conn)
+        try:
+            run_analysis_queries(conn)
+        finally:
+            conn.close()
         return
 
     files = find_ttyrec_files(args.paths)
@@ -629,8 +623,10 @@ def main():
           f"flicker_events={flicker_total}  compaction_events={compact_total}  "
           f"errors={error_count}")
 
-    run_analysis_queries(conn)
-    conn.close()
+    try:
+        run_analysis_queries(conn)
+    finally:
+        conn.close()
 
 
 if __name__ == '__main__':

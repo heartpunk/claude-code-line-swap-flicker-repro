@@ -1,0 +1,17 @@
+[project]
+name = "claude-code-line-swap-flicker-repro"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "hypothesis>=6.0",
+    "mutmut>=3.5",
+    "pytest-cov>=5.0",
+]
+
+[tool.mutmut]
+paths_to_mutate = ["analyze_flicker.py"]
+runner = "uv run pytest test_analyze_flicker.py test_properties.py -x -q"
