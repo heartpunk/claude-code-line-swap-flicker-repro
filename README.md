@@ -14,8 +14,8 @@ context compaction, lines ~3 rows below the compaction spinner visually reorder
 |---|---|
 | `analyze_flicker.py` | Streaming ttyrec parser + SQLite flicker detector |
 | `flicker-report.md` | Full analysis report with corpus stats and fix suggestions |
-| `test_analyze_flicker.py` | Unit + integration tests (173 tests) |
-| `test_properties.py` | Property-based tests (Hypothesis) |
+| `test_analyze_flicker.py` | Unit + integration tests (232 tests) |
+| `test_properties.py` | Property-based tests (21 Hypothesis tests) |
 | `conftest.py` | Hypothesis profile config |
 | `pyproject.py` | Project deps and mutmut config |
 
@@ -49,10 +49,11 @@ Results go into a SQLite database (`flicker.db`) for querying.
 
 ## Findings
 
-- **82/1,617 sessions (5%)** contain detectable flicker
-- **Zero flicker in 2.0.x**, present in every **2.1.x** sub-version tested (2.1.4 → 2.1.59)
+- **82/1,617 recordings (5%)** contain detectable flicker; **298 Claude Code sessions** detected via structural welcome-screen analysis
+- **Rare in 2.0.x** (2–4% of sessions in 2.0.36, 2.0.76), **absent in 2.0.13–2.0.70**, **dramatically worse in 2.1.x** (55–100% of sessions, 2.1.4 → 2.1.62)
 - **~17 flicker bursts per compaction event** in 2.1.34
 - Flicker row peaks at **3 rows** below the spinner (44.6% of events)
+- **30% of flicker** occurs during thinking/tool-use spinners, not just compaction
 
 
 See [flicker-report.md](flicker-report.md) for the full breakdown.

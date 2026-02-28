@@ -1,8 +1,8 @@
 # Bug Report: Line-Swap Flicker During Context Compaction in Claude Code
 
 **Repo with full methodology and source:** https://github.com/heartpunk/claude-code-line-swap-flicker-repro
-**Affected versions:** Claude Code 2.1.x (confirmed 2.1.4 → 2.1.59)
-**Last clean version:** 2.0.x (2.0.13, 2.0.70, 2.0.76 — all flicker-free)
+**Affected versions:** Claude Code 2.0.36+, dramatically worse in 2.1.x (confirmed 2.1.4 → 2.1.62)
+**Last clean version:** 2.0.70 (no flicker in 11 sessions)
 **Platform:** macOS 15 (Darwin 24.6.0), tmux, various terminal emulators
 
 ---
@@ -14,21 +14,24 @@ lines approximately **3 rows below the compaction spinner visually reorder ("fli
 at high frame rates for the duration of the compaction animation.
 
 The bug was characterized by automated analysis of **1,617 ttyrec session recordings**
-spanning mid-2025 through February 2026. Key numbers:
+spanning mid-2025 through February 2026, with **298 Claude Code sessions** identified
+via structural welcome-screen detection. Key numbers:
 
-- **82 sessions (5.1%) contain detectable flicker** — but rate is much higher among
-  sessions that actually reached compaction: ~65% of 2.1.34 sessions that compacted had
+- **82 recordings (5.1%) contain detectable flicker** — but rate is much higher among
+  sessions that actually reached compaction: ~66% of 2.1.34 sessions that compacted had
   measurable flicker
-- **58,692 total flicker bursts** detected across the corpus; 58,683 (99.98%) confirmed
-  inside a Claude Code session boundary
+- **58,692 total flicker bursts** detected across the corpus; **54,221 (92.4%) confirmed
+  inside a Claude Code session boundary** (tighter boundaries from structural detection)
 - **~17 flicker bursts per compaction event** in 2.1.34
-- **71% of events** occur during detected compaction; the remaining **29% occur during
-  other Claude Code spinner animations** (thinking, tool-use) — same root cause, broader
-  trigger surface than previously described
-- **99.98% of non-compaction events** have a co-occurring thinking/tool-use spinner
-  (`thinking_above=1`); only 3 of 16,897 events have neither compaction nor spinner context
-- **Zero flicker in any 2.0.x session** tested
-- Bug present in every 2.1.x sub-version from 2.1.4 through 2.1.59 (latest in corpus)
+- **70% of in-session events** occur during detected compaction; the remaining **30% occur
+  during other Claude Code spinner animations** (thinking, tool-use) — same root cause,
+  broader trigger surface than previously described
+- **99.98% of non-compaction in-session events** have a co-occurring thinking/tool-use
+  spinner (`thinking_above=1`); only 3 of 16,478 events have neither compaction nor
+  spinner context
+- **Low-rate flicker in 2.0.36 and 2.0.76** (2–4% of sessions); **zero in 2.0.13–2.0.70**
+- Bug present and dramatically worse in every 2.1.x sub-version from 2.1.4 through 2.1.62
+  (55–100% of sessions affected)
 
 ---
 
@@ -89,48 +92,61 @@ All ttyrec recordings from `~/.ttyrec/` on a single developer machine:
 
 ### Version Attribution
 
+Structural welcome-screen detection (added in this revision) now attributes versions
+to 220 of 298 sessions, up from ~80 in the previous analysis which relied on matching
+Homebrew Caskroom paths.
+
 | Version | Sessions | Sessions w/ flicker | % affected | Total flicker events |
 |---|---|---|---|---|
 | 2.0.13 | 1 | 0 | **0%** | 0 |
-| 2.0.70 | 3 | 0 | **0%** | 0 |
-| 2.0.76 | 3 | 0 | **0%** | 0 |
-| 2.1.3 | 1 | 0 | 0% | 0 |
-| 2.1.4 | 2 | 1 | **50%** | 695 |
-| 2.1.12 | 2 | 1 | **50%** | 59 |
+| 2.0.25 | 9 | 0 | **0%** | 0 |
+| 2.0.36 | 1 | 1 | **100%** | 239 |
+| 2.0.42 | 9 | 0 | **0%** | 0 |
+| 2.0.64 | 20 | 0 | **0%** | 0 |
+| 2.0.70 | 11 | 0 | **0%** | 0 |
+| 2.0.76 | 48 | 2 | **4%** | 347 |
+| 2.1.4 | 10 | 6 | **60%** | 2,499 |
+| 2.1.12 | 11 | 6 | **55%** | 2,166 |
 | 2.1.14 | 2 | 0 | 0% | 0 |
-| 2.1.15 | 1 | 1 | **100%** | 84 |
-| 2.1.34 | 46 | 30 | **65%** | 29,457 |
-| 2.1.42 | 1 | 1 | **100%** | 239 |
-| 2.1.50 | 2 | 0 | 0% | 0 |
-| 2.1.59 | 1 | 1 | **100%** | 489 |
-| unknown¹ | 1,418 | 47 | 3.3% | 27,669 |
+| 2.1.15 | 8 | 5 | **62%** | 12,145 |
+| 2.1.34 | 56 | 37 | **66%** | 27,318 |
+| 2.1.50 | 12 | 9 | **75%** | 6,799 |
+| 2.1.59 | 2 | 2 | **100%** | 1,543 |
+| 2.1.62 | 10 | 9 | **90%** | 1,162 |
+| unknown¹ | 78 | 1 | 1.3% | 3 |
 
-¹ "unknown" = sessions where a Claude Code version string was not visible in any frame
-  (e.g. the startup banner was not recorded, or the binary path differed). Many of
-  these are genuine Claude Code sessions — the flicker pattern and compaction text are
-  identical; the version was simply not captured.
+¹ "unknown" = sessions where the welcome screen was not captured in any frame.
+  Down from 1,418 in the previous analysis thanks to structural welcome-screen detection.
 
-**The bug is absent in all 2.0.x sessions and present in every 2.1.x sub-version
-tested. It was not fixed at any point through 2.1.59.**
+**Note on 2.0.x flicker:** The 2.0.36 session (239 events, all thinking-spinner) and
+2.0.76 sessions (347 events, mix of compaction and thinking-spinner) were manually
+verified by frame extraction — the welcome screens clearly show `v2.0.36` and `v2.0.76`.
+The 2.0.36 session runs on NixOS with a pinned Claude Code version. This contradicts
+the earlier "zero flicker in 2.0.x" finding, which was based on broken version detection.
+
+**Revised finding:** Flicker is present but **rare** in late 2.0.x (2–4% of sessions),
+**absent** in 2.0.13–2.0.70 (50 sessions, zero flicker), and **dramatically worse**
+in all 2.1.x versions (55–100% of sessions). The bug was not introduced in 2.1.x but
+was significantly amplified.
 
 ### Flicker Intensity in 2.1.34
 
-2.1.34 is the best-sampled version (46 sessions). Among the 30 affected sessions:
+2.1.34 is the best-sampled version (56 sessions). Among the 37 affected sessions:
 
 | Metric | Value |
 |---|---|
-| Total flicker events | 29,457 |
-| Total compaction events (in same sessions) | 1,727 |
-| Average flicker events per compaction | **17.1** |
-| Total frames inside flicker windows | ~884,000 |
+| Total flicker events | 27,318 |
+| Total compaction events (in same sessions) | ~1,600 |
+| Average flicker events per compaction | **~17** |
 | Average flicker burst duration | **~1,254 ms** |
 | Average fps during flicker | **49.5** |
 
 ### Timeline
 
-The earliest flicker appears 2026-01-14 (version 2.1.4). The corpus contains no
-earlier 2.1.x sessions to pin the exact introduction date more precisely, but the
-jump from 2.0.76 → 2.1.x is the clear boundary.
+The earliest flicker in the corpus appears in a 2.0.36 session (thinking-spinner only,
+239 events). The rate increases dramatically in 2.1.x, with the earliest 2.1.x flicker
+at version 2.1.4. The progression from 2.0.x (rare, 2–4%) to 2.1.x (common, 55–100%)
+suggests the interleaved render paths became worse, not that they were newly introduced.
 
 ### Cursor-Up Distance Distribution
 
@@ -178,33 +194,51 @@ line sits exactly halfway between the spinner and the cursor baseline.
 
 | compaction_above | Events | % |
 |---|---|---|
-| 1 (compaction in recent 600 frames) | 41,787 | 71.2% |
-| 0 (no compaction context detected) | 16,905 | 28.8% |
+| 1 (compaction in recent 600 frames) | 37,743 | 69.6% |
+| 0 (no compaction context detected) | 16,478 | 30.4% |
 
-71% of events occur close to a detected compaction event. The remaining 29% were
-investigated in Stage 3 (see below).
+(In-session events only. 70% occur close to a detected compaction event. The remaining
+30% were investigated in Stage 3, see below.)
 
 ### Session Filtering
 
-Claude Code session boundaries were detected in all 82 flicker recordings using
-sync-block activity, compaction text, and version-string signals:
+Claude Code session boundaries were detected using structural welcome-screen detection
+(matching the `╭─── Claude Code vX.Y.Z ───` box header, Claude logo block art, model
+info, terminal title, and other signals), plus sync-block activity and compaction text:
 
 | | |
 |---|---|
+| Total detected Claude Code sessions | 298 (across 291 recordings) |
 | Flicker files with detected sessions | 82 / 82 (100%) |
-| Flicker events inside a session | 58,683 / 58,692 (99.98%) |
-| Non-compaction events inside a session | 16,897 / 16,905 (99.95%) |
+| Flicker events inside a session | 54,221 / 58,692 (92.4%) |
+| Flicker events outside any session | 4,471 (7.6%) |
 
-Session confidence tiers:
+The 4,471 out-of-session events come from recordings where the welcome screen was not
+captured (e.g. recording started after Claude Code was already running).
 
-| Tier | Confidence | Events |
+Session confidence distribution:
+
+| Confidence | Sessions | Description |
 |---|---|---|
-| `confirmed_claude` (has version string) | ≥ 3 | 2,094 |
-| `uncertain` (sync/compact only, no version) | 1–2 | 14,803 |
+| 10 | 46 | Welcome + version + goodbye |
+| 8 | 161 | Welcome + version |
+| 5 | 56 | Welcome screen (no version extracted) |
+| 3 | 4 | Version string only |
+| 2 | 3 | Compact text + sync |
+| 1 | 28 | Sync activity only |
 
-The "uncertain" sessions still have Claude Code's sync-block signature and often
-compaction text; they are almost certainly genuine Claude Code sessions where the
-version banner was not captured.
+**207 of 298 sessions (69%) are at confidence ≥ 8**, a dramatic improvement from the
+previous analysis where most sessions were at confidence 1–2.
+
+Non-compaction in-session events by confidence tier:
+
+| Tier | Confidence | Events | Files |
+|---|---|---|---|
+| `confirmed_claude` (has version/welcome) | ≥ 3 | 16,475 | 59 |
+| `uncertain` (sync only) | 1–2 | 3 | 1 |
+
+With structural detection, **99.98% of non-compaction in-session events are now in
+confirmed Claude Code sessions** (up from 12% in the previous analysis).
 
 ### Stage 3: Non-Compaction Flicker Categorization
 
@@ -242,19 +276,19 @@ any frame with a sync block **and** large cursor-up (≥6) **but without** compa
 text.  This is analogous to how compaction frames are detected but excludes the
 compaction path.
 
-Running a `thinking_above` backfill over all 58,692 corpus events produced:
+Running a `thinking_above` backfill over all in-session events produced:
 
 | compaction_above | thinking_above | Events |
 |---|---|---|
-| 1 (compaction) | yes | 41,786 |
-| 0 (no compaction) | yes | **16,894** |
+| 1 (compaction) | yes | 37,743 |
+| 0 (no compaction) | yes | **16,475** |
 | 0 (no compaction) | **no** | **3** |
 
-**16,894 / 16,897 (99.98%) of non-compaction in-session events have a co-occurring
+**16,475 / 16,478 (99.98%) of non-compaction in-session events have a co-occurring
 thinking/tool-use spinner.** The remaining 3 events are statistical noise — likely
 edge cases in the 600-frame lookback window.
 
-The 41,786 compaction-above events also showing `thinking_above=1` reflects that
+The 37,743 compaction-above events also showing `thinking_above=1` reflects that
 thinking spinners often run in the 600-frame window immediately preceding or
 surrounding compaction — Claude is thinking, context fills up, then compaction fires.
 
@@ -291,7 +325,7 @@ render pattern.
 - Heuristic tuned against a reference 47-minute session (`df3cbab2-...`) with a typed
   marker string to locate the compaction region precisely
 - Spot-checked with `ipbt` frame-by-frame visual rendering
-- Test suite: 194 tests (173 unit/integration + 21 Hypothesis property tests), 83.4% mutation kill rate (mutmut 3.x, 668/801 mutants killed)
+- Test suite: 253 tests (232 unit/integration + 21 Hypothesis property tests), 83.6% mutation kill rate (mutmut 3.x)
 
 ---
 
