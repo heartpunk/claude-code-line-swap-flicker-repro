@@ -19,8 +19,12 @@ spanning mid-2025 through February 2026. Key numbers:
 - **82 sessions (5.1%) contain detectable flicker** — but rate is much higher among
   sessions that actually reached compaction: ~65% of 2.1.34 sessions that compacted had
   measurable flicker
-- **58,692 total flicker bursts** detected across the corpus
+- **58,692 total flicker bursts** detected across the corpus; 58,683 (99.98%) confirmed
+  inside a Claude Code session boundary
 - **~17 flicker bursts per compaction event** in 2.1.34
+- **71% of events** occur during detected compaction; the remaining **29% occur during
+  other Claude Code spinner animations** (thinking, tool-use) — same root cause, broader
+  trigger surface than previously described
 - **Zero flicker in any 2.0.x session** tested
 - Bug present in every 2.1.x sub-version from 2.1.4 through 2.1.59 (latest in corpus)
 
@@ -175,10 +179,59 @@ line sits exactly halfway between the spinner and the cursor baseline.
 | 1 (compaction in recent 600 frames) | 41,787 | 71.2% |
 | 0 (no compaction context detected) | 16,905 | 28.8% |
 
-71% of events occur close to a detected compaction event. The remaining 29% may be:
-(a) rapid streaming tool output producing the same interleaved sync pattern without
-compaction; (b) sessions where compaction text was present in different frames than
-the cursor-up bursts; or (c) a minority of heuristic false positives.
+71% of events occur close to a detected compaction event. The remaining 29% were
+investigated in Stage 3 (see below).
+
+### Session Filtering
+
+Claude Code session boundaries were detected in all 82 flicker recordings using
+sync-block activity, compaction text, and version-string signals:
+
+| | |
+|---|---|
+| Flicker files with detected sessions | 82 / 82 (100%) |
+| Flicker events inside a session | 58,683 / 58,692 (99.98%) |
+| Non-compaction events inside a session | 16,897 / 16,905 (99.95%) |
+
+Session confidence tiers:
+
+| Tier | Confidence | Events |
+|---|---|---|
+| `confirmed_claude` (has version string) | ≥ 3 | 2,094 |
+| `uncertain` (sync/compact only, no version) | 1–2 | 14,803 |
+
+The "uncertain" sessions still have Claude Code's sync-block signature and often
+compaction text; they are almost certainly genuine Claude Code sessions where the
+version banner was not captured.
+
+### Stage 3: Non-Compaction Flicker Categorization
+
+A sample of 50 non-compaction events (compaction_above=0) was drawn across confidence
+tiers and analyzed by examining a 60-frame window around each event:
+
+| Tier | n | true_flicker | false_positive | unclear |
+|---|---|---|---|---|
+| confirmed_claude (conf ≥ 3) | 25 | 20 (80%) | 1 (4%) | 4 (16%) |
+| mystery_08923efa (conf = 2) | 15 | 10 (67%) | 5 (33%) | 0 |
+| uncertain (conf 1–2) | 10 | 6 (60%) | 4 (40%) | 0 |
+| **Total** | **50** | **36 (72%)** | **10 (20%)** | **4 (8%)** |
+
+**Zero events were classified as `missed_compaction`** — the non-compaction flicker
+is not simply due to compaction occurring outside the 600-frame lookback window.
+
+**Key finding:** The 72% classified as `true_flicker` show the identical interleaved
+sync-block pattern (large + small cursor-up values alternating at high fps) but the
+spinner text is **not** a compaction spinner. It is Claude Code's thinking/tool-use
+spinner (e.g. "Wadling…", "Undulating…", "Actualizing…", "thinking…") and subagent
+status displays. The flicker bug fires whenever **any** Claude Code spinner animation
+runs concurrently with input-area redraws — compaction is the most common trigger
+but not the only one.
+
+**False positives (20%):** Primarily multi-pane tmux recordings where a system
+monitor or process viewer occupied one pane (large cursor-up from that pane mixing
+with small cursor-up from another). The `08923efa` mystery file is a long recording
+that mixes genuine Claude Code sessions with system-monitor content in the same
+ttyrec; the Claude Code portions show true flicker.
 
 ---
 
@@ -209,7 +262,7 @@ render pattern.
 - Heuristic tuned against a reference 47-minute session (`df3cbab2-...`) with a typed
   marker string to locate the compaction region precisely
 - Spot-checked with `ipbt` frame-by-frame visual rendering
-- Test suite: 99 unit + property tests (Hypothesis), 93.4% mutation kill rate (mutmut)
+- Test suite: 117 unit + property tests (Hypothesis), 93.4% mutation kill rate (mutmut)
 
 ---
 
