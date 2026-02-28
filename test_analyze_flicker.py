@@ -27,6 +27,10 @@ insert_flicker = _mod.insert_flicker
 analyze_file = _mod.analyze_file
 find_ttyrec_files = _mod.find_ttyrec_files
 run_analysis_queries = _mod.run_analysis_queries
+detect_sessions_in_recording = _mod.detect_sessions_in_recording
+insert_session = _mod.insert_session
+update_flicker_session_flags = _mod.update_flicker_session_flags
+ensure_session_schema = _mod.ensure_session_schema
 WINDOW_SIZE = _mod.WINDOW_SIZE
 MIN_SYNC_BLOCKS = _mod.MIN_SYNC_BLOCKS
 SMALL_CUP_MAX = _mod.SMALL_CUP_MAX
@@ -957,3 +961,326 @@ class TestExtractEventMetadata:
         w.append((0, self._make_feat(ts=1.0, cup_vals=(4, 7, 7, 7, 8))))
         result = extract_event_metadata(w, collections.deque(), 0)
         assert result['cursor_up_spinner'] == 7
+
+
+# ── detect_sessions_in_recording tests ───────────────────────────────────────
+
+class TestDetectSessions:
+    """Tests for detect_sessions_in_recording."""
+
+    def _write_ttyrec(self, payloads: list, ts_step_ms: int = 100) -> str:
+        """Write a ttyrec with the given payloads and return its path."""
+        data = b""
+        for i, p in enumerate(payloads):
+            sec = 1 + (i * ts_step_ms) // 1000
+            usec = ((i * ts_step_ms) % 1000) * 1000
+            data += struct.pack("<III", sec, usec, len(p)) + p
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_empty_file_returns_no_sessions(self):
+        """Empty ttyrec → empty session list."""
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        os.close(fd)
+        try:
+            assert detect_sessions_in_recording(path) == []
+        finally:
+            os.unlink(path)
+
+    def test_no_claude_signals_returns_no_sessions(self):
+        """File with plain text output (no sync blocks) → empty session list."""
+        path = self._write_ttyrec([b"plain terminal output", b"no claude here"])
+        try:
+            assert detect_sessions_in_recording(path) == []
+        finally:
+            os.unlink(path)
+
+    def test_version_string_detected(self):
+        """File with version string → session with start_signal='version' and confidence≥3."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h",  # sync block on frame 0
+            b"claude-code/2.1.34 startup",  # version on frame 1
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            s = sessions[0]
+            assert s['start_signal'] in ('version', 'sync_activity', 'welcome')
+            assert s['confidence'] >= 3
+            assert s['claude_version'] == '2.1.34'
+        finally:
+            os.unlink(path)
+
+    def test_welcome_banner_detected(self):
+        """File with 'Welcome to Claude Code' → session with confidence≥5."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h Welcome to Claude Code v2.1.34",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['confidence'] >= 5
+        finally:
+            os.unlink(path)
+
+    def test_sync_only_confidence_one(self):
+        """File with only sync blocks → session with confidence=1."""
+        path = self._write_ttyrec([b"\\033[?2026h\\033[4A\\033[8A"] * 5)
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['confidence'] == 1
+        finally:
+            os.unlink(path)
+
+    def test_compaction_text_confidence_two(self):
+        """File with compaction text → confidence≥2."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h",
+            b"Compacting context...",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['confidence'] >= 2
+        finally:
+            os.unlink(path)
+
+    def test_version_and_welcome_confidence_eight(self):
+        """Version + welcome banner together → confidence=8."""
+        path = self._write_ttyrec([
+            b"Welcome to Claude Code  claude-code/2.2.0 \\033[?2026h",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['confidence'] >= 8
+        finally:
+            os.unlink(path)
+
+    def test_goodbye_boosts_confidence(self):
+        """Goodbye message boosts confidence by 5 (capped at 10)."""
+        path = self._write_ttyrec([
+            b"claude-code/2.1.34 \\033[?2026h",  # version frame (confidence=3)
+            b"Goodbye from Claude Code session ended",  # goodbye frame
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            s = sessions[0]
+            # Base confidence 3 (version) + 5 (goodbye) = 8, capped at 10
+            assert s['confidence'] >= 8
+        finally:
+            os.unlink(path)
+
+    def test_start_frame_at_first_claude_signal(self):
+        """start_frame is the index of the first frame with any Claude signal."""
+        path = self._write_ttyrec([
+            b"plain output frame 0",        # no signal
+            b"more plain output frame 1",   # no signal
+            b"\\033[?2026h sync frame 2",   # first Claude signal — frame index 2
+            b"\\033[?2026h sync frame 3",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['start_frame'] == 2
+        finally:
+            os.unlink(path)
+
+    def test_end_frame_at_last_sync(self):
+        """end_frame is the index of the last frame with sync blocks."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h sync frame 0",   # Claude signal
+            b"\\033[?2026h sync frame 1",   # Claude signal
+            b"\\033[?2026h sync frame 2",   # last sync — frame index 2
+            b"plain output no sync",        # no signal after
+            b"plain output no sync",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            # end_frame should be 2 (last sync), not 4 (end of file)
+            assert sessions[0]['end_frame'] == 2
+        finally:
+            os.unlink(path)
+
+    def test_goodbye_frame_used_as_end_when_before_eof(self):
+        """When goodbye appears before last sync, end_frame is at goodbye."""
+        path = self._write_ttyrec([
+            b"claude-code/2.1.34 \\033[?2026h frame 0",
+            b"Goodbye from Claude Code \\033[?2026h frame 1",  # goodbye on frame 1
+            b"\\033[?2026h sync after goodbye frame 2",         # sync AFTER goodbye
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            # goodbye is on frame 1; end_frame should be 1, not 2
+            assert sessions[0]['end_frame'] == 1
+        finally:
+            os.unlink(path)
+
+    def test_session_fields_present(self):
+        """All expected fields must be present in the returned session dict."""
+        path = self._write_ttyrec([b"\\033[?2026h sync"])
+        expected_fields = {
+            'start_frame', 'end_frame', 'start_ts_us', 'end_ts_us',
+            'claude_version', 'confidence', 'start_signal',
+        }
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert set(sessions[0].keys()) == expected_fields
+        finally:
+            os.unlink(path)
+
+    def test_timestamps_in_microseconds(self):
+        """start_ts_us and end_ts_us are timestamps in microseconds."""
+        data = b""
+        # Frame 0: sec=10, usec=500000, sync signal
+        data += struct.pack("<III", 10, 500_000, len(b"\\033[?2026h")) + b"\\033[?2026h"
+        # Frame 1: sec=11, usec=0, sync signal
+        data += struct.pack("<III", 11, 0, len(b"\\033[?2026h")) + b"\\033[?2026h"
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            s = sessions[0]
+            assert s['start_ts_us'] == 10_500_000  # 10.5s in microseconds
+            assert s['end_ts_us'] == 11_000_000    # 11.0s in microseconds
+        finally:
+            os.unlink(path)
+
+
+# ── Session DB operations tests ───────────────────────────────────────────────
+
+class TestSessionDbOps:
+    """Tests for insert_session, update_flicker_session_flags, ensure_session_schema."""
+
+    def _fresh_db(self) -> sqlite3.Connection:
+        """Create a fresh in-memory DB with both base and session schema."""
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        return conn
+
+    def _insert_test_recording(self, conn) -> int:
+        """Insert a minimal recording and return its id."""
+        return insert_recording(conn, {
+            'path': '/tmp/test.lz',
+            'file_size_bytes': 1000,
+            'frame_count': 100,
+            'duration_us': 10_000_000,
+            'start_ts_us': 1_000_000,
+            'end_ts_us': 11_000_000,
+            'claude_version': '2.1.34',
+            'has_compaction': 1,
+            'compaction_count': 3,
+            'flicker_count': 2,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+
+    def test_insert_session_returns_id(self):
+        """insert_session returns the row id of the inserted session."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 10, 'end_frame': 90,
+            'start_ts_us': 1_000_000, 'end_ts_us': 9_000_000,
+            'claude_version': '2.1.34',
+            'confidence': 3, 'start_signal': 'version',
+        }
+        sid = insert_session(conn, rec_id, session)
+        assert isinstance(sid, int)
+        assert sid > 0
+
+    def test_insert_session_stores_fields(self):
+        """All session fields are persisted correctly."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 5, 'end_frame': 85,
+            'start_ts_us': 2_000_000, 'end_ts_us': 8_000_000,
+            'claude_version': '2.1.99',
+            'confidence': 8, 'start_signal': 'welcome',
+        }
+        sid = insert_session(conn, rec_id, session)
+        row = conn.execute(
+            "SELECT recording_id, session_start_frame, session_end_frame, "
+            "claude_version, confidence, start_signal FROM claude_sessions WHERE id = ?",
+            (sid,)
+        ).fetchone()
+        assert row[0] == rec_id
+        assert row[1] == 5
+        assert row[2] == 85
+        assert row[3] == '2.1.99'
+        assert row[4] == 8
+        assert row[5] == 'welcome'
+
+    def test_update_flicker_flags_marks_in_session(self):
+        """Events whose start_frame falls within session bounds get is_in_session=1."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        # Insert a flicker event at frame 50 (within session 10..90)
+        insert_flicker(conn, rec_id, {
+            'start_frame': 50, 'end_frame': 60,
+            'start_ts_us': 5_000_000, 'end_ts_us': 6_000_000,
+            'duration_us': 1_000_000, 'frame_count': 10,
+            'frames_per_second': 10.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 4, 'cursor_up_spinner': 8,
+            'sync_block_count': 5, 'line_clear_count': 0,
+        })
+        session = {'start_frame': 10, 'end_frame': 90,
+                   'start_ts_us': 1_000_000, 'end_ts_us': 9_000_000,
+                   'claude_version': '2.1.34', 'confidence': 3, 'start_signal': 'version'}
+        sid = insert_session(conn, rec_id, session)
+        update_flicker_session_flags(conn, rec_id, [session], [sid])
+
+        row = conn.execute(
+            "SELECT is_in_session, session_id FROM flicker_events WHERE recording_id = ?",
+            (rec_id,)
+        ).fetchone()
+        assert row[0] == 1
+        assert row[1] == sid
+
+    def test_update_flicker_flags_outside_session_stays_zero(self):
+        """Events outside session bounds keep is_in_session=0."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        # Insert a flicker event at frame 5 (BEFORE session starts at frame 10)
+        insert_flicker(conn, rec_id, {
+            'start_frame': 5, 'end_frame': 8,
+            'start_ts_us': 500_000, 'end_ts_us': 800_000,
+            'duration_us': 300_000, 'frame_count': 3,
+            'frames_per_second': 10.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 4, 'cursor_up_spinner': 8,
+            'sync_block_count': 3, 'line_clear_count': 0,
+        })
+        session = {'start_frame': 10, 'end_frame': 90,
+                   'start_ts_us': 1_000_000, 'end_ts_us': 9_000_000,
+                   'claude_version': '2.1.34', 'confidence': 3, 'start_signal': 'version'}
+        sid = insert_session(conn, rec_id, session)
+        update_flicker_session_flags(conn, rec_id, [session], [sid])
+
+        row = conn.execute(
+            "SELECT COALESCE(is_in_session, 0) FROM flicker_events WHERE recording_id = ?",
+            (rec_id,)
+        ).fetchone()
+        assert row[0] == 0
+
+    def test_ensure_session_schema_idempotent(self):
+        """ensure_session_schema can be called multiple times without error."""
+        conn = self._fresh_db()
+        # Call again — should not raise
+        ensure_session_schema(conn)
+        ensure_session_schema(conn)
+        # Table should exist exactly once
+        count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='claude_sessions'"
+        ).fetchone()[0]
+        assert count == 1

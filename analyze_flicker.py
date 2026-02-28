@@ -66,6 +66,10 @@ PANE_RE = re.compile(rb'^%extended-output %(\d+)')
 GEOM_LIT = re.compile(rb'\\033\[8;(\d+);(\d+)t')        # literal \033 form
 GEOM_RAW = re.compile(b'\x1b' + rb'\[8;(\d+);(\d+)t')   # actual ESC byte form
 
+# Session boundary patterns
+WELCOME_RE = re.compile(rb'Welcome\s+to\s+Claude\s+Code', re.IGNORECASE)
+GOODBYE_RE = re.compile(rb'Goodbye\s+from\s+Claude\s+Code', re.IGNORECASE)
+
 
 # ── Streaming parser ─────────────────────────────────────────────────────────
 
@@ -321,11 +325,43 @@ CREATE INDEX IF NOT EXISTS idx_recording_version ON recordings(claude_version);
 """
 
 
+SESSION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS claude_sessions (
+    id INTEGER PRIMARY KEY,
+    recording_id INTEGER NOT NULL REFERENCES recordings(id),
+    session_start_frame INTEGER NOT NULL,
+    session_end_frame INTEGER NOT NULL,
+    session_start_ts_us INTEGER,
+    session_end_ts_us INTEGER,
+    claude_version TEXT,
+    confidence INTEGER NOT NULL DEFAULT 0,
+    start_signal TEXT,
+    detected_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_recording ON claude_sessions(recording_id);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
+
+
+def ensure_session_schema(conn: sqlite3.Connection):
+    """Add claude_sessions table and session columns to flicker_events if not present."""
+    conn.executescript(SESSION_SCHEMA)
+    conn.commit()
+    for col_def in [
+        "ALTER TABLE flicker_events ADD COLUMN session_id INTEGER REFERENCES claude_sessions(id)",
+        "ALTER TABLE flicker_events ADD COLUMN is_in_session INTEGER DEFAULT 0",
+    ]:
+        try:
+            conn.execute(col_def)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
 
 def insert_recording(conn, rec: dict) -> int:
@@ -372,6 +408,348 @@ def insert_flicker(conn, recording_id: int, event: dict):
         ),
     )
     conn.commit()
+
+
+def insert_session(conn: sqlite3.Connection, recording_id: int, session: dict) -> int:
+    """Insert a detected session into claude_sessions. Returns the session id."""
+    cur = conn.execute(
+        """
+        INSERT INTO claude_sessions
+            (recording_id, session_start_frame, session_end_frame,
+             session_start_ts_us, session_end_ts_us,
+             claude_version, confidence, start_signal, detected_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            recording_id,
+            session['start_frame'], session['end_frame'],
+            session.get('start_ts_us', 0), session.get('end_ts_us', 0),
+            session.get('claude_version'),
+            session['confidence'],
+            session.get('start_signal'),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_flicker_session_flags(
+    conn: sqlite3.Connection,
+    recording_id: int,
+    sessions: list,
+    session_ids: list,
+):
+    """Mark flicker_events as is_in_session=1 for events within any session boundary."""
+    for session, sid in zip(sessions, session_ids):
+        conn.execute(
+            """
+            UPDATE flicker_events
+            SET is_in_session = 1, session_id = ?
+            WHERE recording_id = ?
+              AND start_frame >= ?
+              AND start_frame <= ?
+            """,
+            (sid, recording_id, session['start_frame'], session['end_frame']),
+        )
+    conn.commit()
+
+
+# ── Session detection ─────────────────────────────────────────────────────────
+
+def detect_sessions_in_recording(path: str) -> list:
+    """
+    Detect Claude Code session boundaries in a ttyrec recording.
+
+    Returns a list of session dicts (usually 0 or 1 per file). Each has:
+        start_frame, end_frame, start_ts_us, end_ts_us,
+        claude_version, confidence, start_signal
+
+    Confidence scale:
+        1 = sync block activity only
+        2 = compaction text (likely Claude Code)
+        3 = version string found (definitely Claude Code)
+        5 = welcome banner found
+        8 = version + welcome banner
+        +5 if goodbye message found (capped at 10)
+    """
+    frame_count = 0
+
+    first_claude_frame = None
+    first_claude_ts = 0.0
+    first_signal = None
+    best_confidence = 0
+    first_version = None
+    saw_welcome = False
+
+    last_sync_frame = None
+    last_sync_ts = 0.0
+    last_frame_ts = 0.0
+
+    goodbye_frame = None
+    goodbye_ts = 0.0
+
+    try:
+        for frame in stream_frames(path):
+            feat = extract_features(frame)
+            p = frame['payload']
+            ts = feat['ts']
+
+            frame_confidence = 0
+            frame_signal = None
+
+            if feat['sync_count'] > 0:
+                frame_signal = 'sync_activity'
+                frame_confidence = 1
+                last_sync_frame = frame_count
+                last_sync_ts = ts
+
+            if feat['is_compact']:
+                frame_confidence = max(frame_confidence, 2)
+                frame_signal = 'compact'
+
+            if feat['version']:
+                frame_confidence = max(frame_confidence, 3)
+                frame_signal = 'version'
+                if first_version is None:
+                    first_version = feat['version']
+
+            if WELCOME_RE.search(p):
+                frame_confidence = max(frame_confidence, 5)
+                frame_signal = 'welcome'
+                saw_welcome = True
+
+            if GOODBYE_RE.search(p):
+                goodbye_frame = frame_count
+                goodbye_ts = ts
+
+            if frame_signal is not None:
+                if first_claude_frame is None:
+                    first_claude_frame = frame_count
+                    first_claude_ts = ts
+                    first_signal = frame_signal
+                if frame_confidence > best_confidence:
+                    best_confidence = frame_confidence
+
+            last_frame_ts = ts
+            frame_count += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    if first_claude_frame is None:
+        return []
+
+    # Combine signals for final confidence
+    confidence = best_confidence
+    if first_version and saw_welcome:
+        confidence = max(confidence, 8)
+
+    if goodbye_frame is not None:
+        end_frame = goodbye_frame
+        end_ts = goodbye_ts
+        confidence = min(confidence + 5, 10)
+    elif last_sync_frame is not None:
+        end_frame = last_sync_frame
+        end_ts = last_sync_ts
+    else:
+        end_frame = max(frame_count - 1, 0)
+        end_ts = last_frame_ts
+
+    return [{
+        'start_frame': first_claude_frame,
+        'end_frame': end_frame,
+        'start_ts_us': int(first_claude_ts * 1_000_000),
+        'end_ts_us': int(end_ts * 1_000_000),
+        'claude_version': first_version,
+        'confidence': confidence,
+        'start_signal': first_signal,
+    }]
+
+
+def detect_and_store_sessions(
+    conn: sqlite3.Connection,
+    verbose: bool = False,
+    skip_existing: bool = True,
+    flicker_only: bool = False,
+) -> dict:
+    """
+    Detect Claude Code sessions for all recordings in the DB and store results.
+
+    Args:
+        conn: DB connection (session schema must already be initialized).
+        verbose: Print per-file progress.
+        skip_existing: Skip recordings that already have sessions.
+        flicker_only: Only process recordings that have flicker events.
+
+    Returns dict with summary stats.
+    """
+    ensure_session_schema(conn)
+
+    base_query = """
+        SELECT r.id, r.path, r.claude_version
+        FROM recordings r
+    """
+    filters = []
+    if skip_existing:
+        filters.append(
+            "NOT EXISTS (SELECT 1 FROM claude_sessions cs WHERE cs.recording_id = r.id)"
+        )
+    if flicker_only:
+        filters.append("r.flicker_count > 0")
+
+    if filters:
+        base_query += " WHERE " + " AND ".join(filters)
+
+    rows = conn.execute(base_query).fetchall()
+    total = len(rows)
+
+    sessions_found = 0
+    no_signals = 0
+
+    print(f"Detecting sessions in {total} recordings...")
+
+    t_start = time.monotonic()
+    for i, (rec_id, path, known_version) in enumerate(rows, 1):
+        if verbose:
+            print(f"  [{i}/{total}] {os.path.basename(path)}")
+        else:
+            elapsed = time.monotonic() - t_start
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (total - i) / rate if rate > 0 else 0
+            print(
+                f"\r  [{i:5d}/{total}] {100*i/total:5.1f}%  "
+                f"sessions={sessions_found}  "
+                f"rate={rate:.1f}/s  eta={eta:.0f}s    ",
+                end='', flush=True,
+            )
+
+        if not os.path.exists(path):
+            no_signals += 1
+            continue
+
+        sessions = detect_sessions_in_recording(path)
+
+        if sessions:
+            session_ids = []
+            for session in sessions:
+                if not session['claude_version'] and known_version:
+                    session['claude_version'] = known_version
+                sid = insert_session(conn, rec_id, session)
+                session_ids.append(sid)
+            update_flicker_session_flags(conn, rec_id, sessions, session_ids)
+            sessions_found += len(sessions)
+        else:
+            no_signals += 1
+            if verbose:
+                print(f"    No Claude Code signals detected")
+
+    if not verbose:
+        print()
+
+    return {
+        'total_processed': total,
+        'sessions_found': sessions_found,
+        'no_signals': no_signals,
+    }
+
+
+def session_stats_report(conn: sqlite3.Connection):
+    """Show session-filtered statistics for flicker events."""
+    print("\n" + "=" * 60)
+    print("SESSION ANALYSIS")
+    print("=" * 60)
+
+    try:
+        conn.execute("SELECT session_id FROM flicker_events LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Session schema not initialized. Run --detect-sessions first.")
+        return
+
+    row = conn.execute("SELECT COUNT(*) FROM claude_sessions").fetchone()
+    print(f"\nTotal sessions detected: {row[0]}")
+
+    rows = conn.execute(
+        """
+        SELECT COUNT(*) as recordings_with_sessions,
+               COUNT(DISTINCT recording_id) as unique_recordings
+        FROM claude_sessions
+        """
+    ).fetchone()
+    print(f"Recordings with sessions: {rows[1]}")
+
+    print("\n-- Confidence distribution --")
+    for row in conn.execute(
+        "SELECT confidence, COUNT(*) FROM claude_sessions GROUP BY confidence ORDER BY confidence DESC"
+    ):
+        print(f"  confidence={row[0]:2d}  sessions={row[1]}")
+
+    print("\n-- Start signal distribution --")
+    for row in conn.execute(
+        "SELECT start_signal, COUNT(*) FROM claude_sessions GROUP BY start_signal ORDER BY COUNT(*) DESC"
+    ):
+        print(f"  signal={row[0] or 'none':16s}  sessions={row[1]}")
+
+    print("\n-- Flicker events: in-session vs outside --")
+    for row in conn.execute(
+        "SELECT COALESCE(is_in_session,0), COUNT(*) FROM flicker_events GROUP BY COALESCE(is_in_session,0)"
+    ):
+        label = "in_session" if row[0] == 1 else "outside_session"
+        print(f"  {label}: {row[1]}")
+
+    print("\n-- Non-compaction events (compaction_above=0): in-session vs outside --")
+    for row in conn.execute(
+        """
+        SELECT COALESCE(is_in_session,0), COUNT(*)
+        FROM flicker_events WHERE compaction_above = 0
+        GROUP BY COALESCE(is_in_session,0)
+        """
+    ):
+        label = "in_session" if row[0] == 1 else "outside_session"
+        print(f"  {label}: {row[1]}")
+
+    print("\n-- In-session flicker events by Claude version --")
+    for row in conn.execute(
+        """
+        SELECT r.claude_version, COUNT(f.id)
+        FROM flicker_events f
+        JOIN recordings r ON r.id = f.recording_id
+        WHERE COALESCE(f.is_in_session, 0) = 1
+        GROUP BY r.claude_version
+        ORDER BY COUNT(f.id) DESC
+        """
+    ):
+        print(f"  version={row[0] or 'unknown':20s}  events={row[1]}")
+
+    print("\n-- Recordings with flicker events but no detected session --")
+    rows = conn.execute(
+        """
+        SELECT r.path, r.claude_version, r.flicker_count
+        FROM recordings r
+        WHERE r.flicker_count > 0
+          AND NOT EXISTS (SELECT 1 FROM claude_sessions cs WHERE cs.recording_id = r.id)
+        ORDER BY r.flicker_count DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    if rows:
+        for row in rows:
+            print(f"  {row[2]:4d}x  {row[1] or '?':10s}  {os.path.basename(row[0])}")
+    else:
+        print("  (none)")
+
+    print("\n-- Top files by non-compaction in-session events --")
+    for row in conn.execute(
+        """
+        SELECT r.path, r.claude_version, COUNT(f.id) as nc_events
+        FROM flicker_events f
+        JOIN recordings r ON r.id = f.recording_id
+        WHERE f.compaction_above = 0 AND COALESCE(f.is_in_session, 0) = 1
+        GROUP BY r.id
+        ORDER BY nc_events DESC
+        LIMIT 10
+        """
+    ):
+        print(f"  {row[2]:5d}x  {row[1] or '?':10s}  {os.path.basename(row[0])}")
 
 
 # ── Per-file analysis ─────────────────────────────────────────────────────────
@@ -567,9 +945,40 @@ def main():
                         help='Skip files already in the database')
     parser.add_argument('--query-only', action='store_true',
                         help='Skip processing, just run analysis queries')
+    parser.add_argument('--detect-sessions', action='store_true',
+                        help='Detect Claude Code session boundaries for all recordings in DB')
+    parser.add_argument('--session-report', action='store_true',
+                        help='Show session-filtered statistics')
+    parser.add_argument('--flicker-only', action='store_true',
+                        help='With --detect-sessions: only process recordings with flicker events')
     args = parser.parse_args()
 
     conn = init_db(args.db)
+
+    if args.detect_sessions:
+        ensure_session_schema(conn)
+        stats = detect_and_store_sessions(
+            conn,
+            verbose=args.verbose,
+            flicker_only=args.flicker_only,
+        )
+        print(
+            f"\nSession detection complete: "
+            f"processed={stats['total_processed']}  "
+            f"sessions_found={stats['sessions_found']}  "
+            f"no_signals={stats['no_signals']}"
+        )
+        if args.session_report:
+            session_stats_report(conn)
+        conn.close()
+        return
+
+    if args.session_report:
+        try:
+            session_stats_report(conn)
+        finally:
+            conn.close()
+        return
 
     if args.query_only:
         try:
