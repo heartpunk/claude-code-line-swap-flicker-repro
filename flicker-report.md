@@ -1,191 +1,244 @@
-# Claude Code Line-Swap Flicker Analysis Report
+# Bug Report: Line-Swap Flicker During Context Compaction in Claude Code
 
-## Summary
-
-This report documents automated detection of a visual bug in Claude Code's terminal UI:
-during context compaction, lines visually reorder ("flicker") approximately 3–4 rows below
-the compaction spinner.
-
-**Key finding**: The bug is present in Claude Code version **2.1.34** and manifests as
-two interleaved sync blocks targeting different rows of the screen during compaction.
+**Repo with full methodology and source:** https://github.com/heartpunk/claude-code-line-swap-flicker-repro
+**Affected versions:** Claude Code 2.1.x (confirmed 2.1.4 → 2.1.59)
+**Last clean version:** 2.0.x (2.0.13, 2.0.70, 2.0.76 — all flicker-free)
+**Platform:** macOS 15 (Darwin 24.6.0), tmux, various terminal emulators
 
 ---
 
-## Bug Description
+## Executive Summary
 
-### What the user sees
+Claude Code's terminal UI exhibits a reproducible visual glitch during context compaction:
+lines approximately **3 rows below the compaction spinner visually reorder ("flicker")**
+at high frame rates for the duration of the compaction animation.
 
-During context compaction, the terminal shows a spinner (e.g., "Compacting conversation…").
-Lines approximately 3–4 rows *below* the spinner visually reorder or flicker during this time.
+The bug was characterized by automated analysis of **1,617 ttyrec session recordings**
+spanning mid-2025 through February 2026. Key numbers:
 
-### Root cause (from recording analysis)
-
-Claude Code uses DEC private mode 2026 (synchronized output) to batch screen updates.
-During compaction, two separate sync blocks are sent in rapid succession:
-
-1. **Spinner update** — moves cursor up N rows (typically 6–8) to update the compaction
-   spinner line, then returns cursor to original position
-2. **Input rendering** — moves cursor up M rows (typically 3–4, where M < N) to update
-   the user input area
-
-These two sync blocks interleave at high frequency (12–85+ fps), causing different areas
-of the screen to be repainted alternately without a full-screen redraw. The visual effect
-is lines appearing to swap or flicker.
+- **82 sessions (5.1%) contain detectable flicker** — but rate is much higher among
+  sessions that actually reached compaction: ~65% of 2.1.34 sessions that compacted had
+  measurable flicker
+- **58,692 total flicker bursts** detected across the corpus
+- **~17 flicker bursts per compaction event** in 2.1.34
+- **Zero flicker in any 2.0.x session** tested
+- Bug present in every 2.1.x sub-version from 2.1.4 through 2.1.59 (latest in corpus)
 
 ---
 
-## Detection Method
+## What It Looks Like
 
-### Tool chain
-- Direct binary ttyrec file parsing (no third-party tools required)
-- Streaming one-pass algorithm with constant memory (30-frame sliding window)
-- SQLite output for structured querying
-
-### Escape sequence encoding
-ttyrec files in this corpus use tmux's `%extended-output` protocol format, which encodes
-the ESC character as the literal 4-byte text string `\033` (backslash + "033"), not the
-actual ESC byte (0x1B). This is critical for correct pattern matching.
-
-### Heuristic
-
-A **flicker event** is detected when a 30-frame window (≤2.5 seconds) satisfies ALL of:
-
-1. At least one sync block start (`\033[?2026h`) in the window
-2. At least 5 cursor-up escape sequences total
-3. At least 2 cursor-up values ≤5 ("small" — input row distance)
-4. At least 2 cursor-up values ≥6 ("large" — spinner row distance)
-5. At least one compaction text frame ("Compacting", "PreCompact", "Auto-compact")
-   within the preceding 600 frames
+During compaction, Claude Code displays a spinner (e.g. "Compacting conversation…").
+While that animation plays, lines roughly 3 rows below the spinner rapidly jump up and
+back, visually swapping with adjacent content, for the entire ~1–2 second duration of
+each compaction animation frame. The effect is a stutter or shimmer in the lower portion
+of the UI — most visible in a tmux session or any terminal that processes sync blocks.
 
 ---
 
-## Results (Partial — batch in progress)
+## Root Cause (from Recording Analysis)
 
-> **Note**: These are interim results. The full corpus of ~1,611 files takes ~25 minutes to
-> process. Run `python3 analyze-flicker.py --query-only --db flicker.db` for current counts.
+Claude Code uses **DEC private mode 2026 (synchronized output)** to batch screen updates,
+signalled by `ESC[?2026h` (begin sync) / `ESC[?2026l` (end sync / flush). During
+compaction, two independent render paths emit sync blocks in rapid alternation:
 
-### Files analyzed
-- Total: 1,612 files in `~/.ttyrec/` (1,603 compressed `.lz`, 9 uncompressed)
-- Total size: ~2.6 GB
+**Spinner sync block** — moves cursor up a large number of rows (typically 6–12,
+depending on terminal geometry) to repaint the compaction spinner, then returns:
 
-### Reference file verification
-**File**: `df3cbab2-1479-11f1-bbd7-32962d695674`
-- Claude version: **2.1.34**
-- Total frames: 82,000+
-- Compaction events: 109
-- Flicker events detected: **396**
-- All 396 events have `compaction_above=1` ✓
-- Flicker cursor-up distribution: 1 (50 events), 3 (285 events), 4 (61 events)
-- Spinner cursor-up distribution: 6–8 typical (up to 16 observed)
-
----
-
-## Database Schema
-
-```sql
--- recordings: one row per ttyrec file
-CREATE TABLE recordings (
-    id INTEGER PRIMARY KEY,
-    path TEXT UNIQUE,
-    file_size_bytes INTEGER,
-    frame_count INTEGER,
-    duration_us INTEGER,
-    start_ts_us INTEGER,
-    end_ts_us INTEGER,
-    claude_version TEXT,        -- e.g. "2.1.34"
-    has_compaction INTEGER,     -- any compaction text found?
-    compaction_count INTEGER,   -- compaction text frame count (may over-count)
-    flicker_count INTEGER,      -- detected flicker events
-    processed_at TEXT           -- ISO8601 timestamp
-);
-
--- flicker_events: one row per detected flicker window
-CREATE TABLE flicker_events (
-    id INTEGER PRIMARY KEY,
-    recording_id INTEGER REFERENCES recordings(id),
-    start_frame INTEGER,
-    end_frame INTEGER,
-    start_ts_us INTEGER,
-    end_ts_us INTEGER,
-    duration_us INTEGER,
-    frame_count INTEGER,
-    frames_per_second REAL,     -- fps during flicker (12–85+ fps observed)
-    compaction_above INTEGER,   -- 1 if compaction found in lookback window
-    compaction_frame_offset INTEGER, -- frames since nearest compaction
-    cursor_up_rows INTEGER,     -- dominant small cursor-up value (3–4 typical)
-    cursor_up_spinner INTEGER,  -- dominant large cursor-up value (6–8 typical)
-    sync_block_count INTEGER,   -- sync blocks in window
-    line_clear_count INTEGER    -- line clear (2K) count in window
-);
+```
+ESC[?2026h ... ESC[6A ... <spinner content> ... ESC[?2026l
 ```
 
----
+**Input-area sync block** — moves cursor up a small number of rows (typically 3,
+sometimes 1–4) to repaint the user input area:
 
-## Analysis Queries
-
-```sql
--- Is compaction always before the flicker?
-SELECT compaction_above, COUNT(*) FROM flicker_events GROUP BY compaction_above;
-
--- Which versions show the bug?
-SELECT r.claude_version, COUNT(DISTINCT r.id) files, COUNT(f.id) events
-FROM recordings r JOIN flicker_events f ON f.recording_id = r.id
-GROUP BY r.claude_version ORDER BY events DESC;
-
--- Cursor-up row distribution (flicker rows)
-SELECT cursor_up_rows, COUNT(*) FROM flicker_events
-GROUP BY cursor_up_rows ORDER BY cursor_up_rows;
-
--- How close to compaction does flicker occur?
-SELECT AVG(compaction_frame_offset), MIN(compaction_frame_offset), MAX(compaction_frame_offset)
-FROM flicker_events WHERE compaction_above = 1;
-
--- Frame rate during flicker
-SELECT AVG(frames_per_second), MAX(frames_per_second), MIN(frames_per_second)
-FROM flicker_events;
+```
+ESC[?2026h ... ESC[3A ... <input content> ... ESC[?2026l
 ```
 
+These two streams **interleave at 37–49 fps** (observed range 12–9,325 fps, latter
+being tmux bulk writes). Because each targets a different vertical region, the terminal
+alternately renders the input area at "row R" and "row R+3" on successive frames —
+producing the visual stutter.
+
+> **Note on ESC encoding in tmux recordings:** tmux's `%extended-output` protocol
+> encodes ESC as the literal 4-byte text `\033` (0x5C 0x30 0x33 0x33) rather than
+> the actual ESC byte (0x1B). Analysis tooling must match the literal form.
+
 ---
 
-## Usage
+## Corpus Analysis
 
-### Run full analysis
+### Dataset
+
+All ttyrec recordings from `~/.ttyrec/` on a single developer machine:
+
+| | |
+|---|---|
+| Total recordings | 1,617 |
+| Compressed (lzip) | 1,608 |
+| Uncompressed | 9 |
+| Total corpus size | ~2.6 GB |
+| Date range | ~mid-2025 through 2026-02-28 |
+
+### Version Attribution
+
+| Version | Sessions | Sessions w/ flicker | % affected | Total flicker events |
+|---|---|---|---|---|
+| 2.0.13 | 1 | 0 | **0%** | 0 |
+| 2.0.70 | 3 | 0 | **0%** | 0 |
+| 2.0.76 | 3 | 0 | **0%** | 0 |
+| 2.1.3 | 1 | 0 | 0% | 0 |
+| 2.1.4 | 2 | 1 | **50%** | 695 |
+| 2.1.12 | 2 | 1 | **50%** | 59 |
+| 2.1.14 | 2 | 0 | 0% | 0 |
+| 2.1.15 | 1 | 1 | **100%** | 84 |
+| 2.1.34 | 46 | 30 | **65%** | 29,457 |
+| 2.1.42 | 1 | 1 | **100%** | 239 |
+| 2.1.50 | 2 | 0 | 0% | 0 |
+| 2.1.59 | 1 | 1 | **100%** | 489 |
+| unknown¹ | 1,418 | 47 | 3.3% | 27,669 |
+
+¹ "unknown" = sessions where a Claude Code version string was not visible in any frame
+  (e.g. the startup banner was not recorded, or the binary path differed). Many of
+  these are genuine Claude Code sessions — the flicker pattern and compaction text are
+  identical; the version was simply not captured.
+
+**The bug is absent in all 2.0.x sessions and present in every 2.1.x sub-version
+tested. It was not fixed at any point through 2.1.59.**
+
+### Flicker Intensity in 2.1.34
+
+2.1.34 is the best-sampled version (46 sessions). Among the 30 affected sessions:
+
+| Metric | Value |
+|---|---|
+| Total flicker events | 29,457 |
+| Total compaction events (in same sessions) | 1,727 |
+| Average flicker events per compaction | **17.1** |
+| Total frames inside flicker windows | ~884,000 |
+| Average flicker burst duration | **~1,254 ms** |
+| Average fps during flicker | **49.5** |
+
+### Timeline
+
+The earliest flicker appears 2026-01-14 (version 2.1.4). The corpus contains no
+earlier 2.1.x sessions to pin the exact introduction date more precisely, but the
+jump from 2.0.76 → 2.1.x is the clear boundary.
+
+### Cursor-Up Distance Distribution
+
+#### Flicker row (small cursor-up, ≤5)
+
+| Rows | Events | % |
+|---|---|---|
+| 1 | 13,122 | 22.4% |
+| 2 | 12,258 | 20.9% |
+| **3** | **26,203** | **44.6%** |
+| 4 | 6,363 | 10.8% |
+| 5 | 746 | 1.3% |
+
+**3 rows accounts for nearly half of all flicker events**, confirming the subjective
+impression that the affected line sits ~3 rows below the spinner.
+
+#### Spinner row (large cursor-up, ≥6) — top values
+
+| Rows | Events |
+|---|---|
+| 6 | 24,908 |
+| 7 | 8,279 |
+| 10 | 3,705 |
+| 11 | 2,252 |
+| 9 | 1,915 |
+| **12** | **11,240** |
+
+The bimodal distribution (peaks at 6 and 12) likely reflects different terminal heights
+or UI configurations across sessions.
+
+#### Most common (spinner, flicker) pairs
+
+| Spinner rows | Flicker rows | Events |
+|---|---|---|
+| **6** | **3** | **9,584** |
+| 6 | 1 | 4,143 |
+| 7 | 3 | 2,786 |
+| 7 | 4 | 1,699 |
+| 10 | 3 | 1,550 |
+
+The dominant case — spinner at 6 rows up, flicker at 3 rows up — implies the flicker
+line sits exactly halfway between the spinner and the cursor baseline.
+
+### Compaction Proximity
+
+| compaction_above | Events | % |
+|---|---|---|
+| 1 (compaction in recent 600 frames) | 41,787 | 71.2% |
+| 0 (no compaction context detected) | 16,905 | 28.8% |
+
+71% of events occur close to a detected compaction event. The remaining 29% may be:
+(a) rapid streaming tool output producing the same interleaved sync pattern without
+compaction; (b) sessions where compaction text was present in different frames than
+the cursor-up bursts; or (c) a minority of heuristic false positives.
+
+---
+
+## Detection Methodology
+
+Full source at https://github.com/heartpunk/claude-code-line-swap-flicker-repro
+
+### Algorithm
+
+A single streaming pass per file with O(1) memory:
+- 30-frame sliding window (circular buffer)
+- 600-frame bounded deque tracking compaction context
+
+A window is flagged as a flicker event if **all** of:
+1. ≥15 frames in window (WINDOW_SIZE // 2)
+2. Window spans ≤2.5 seconds wall-clock
+3. ≥3 synchronized-output block starts (`ESC[?2026h` in either encoding)
+4. ≥5 cursor-up escapes total across all frames
+5. ≥2 "small" cursor-up values (≤5 rows)
+6. ≥2 "large" cursor-up values (≥6 rows)
+
+Conditions 5 + 6 together are the core signal: the simultaneous presence of both
+small and large cursor-up values within one short window is specific to the interleaved
+render pattern.
+
+### Validation
+
+- Heuristic tuned against a reference 47-minute session (`df3cbab2-...`) with a typed
+  marker string to locate the compaction region precisely
+- Spot-checked with `ipbt` frame-by-frame visual rendering
+- Test suite: 99 unit + property tests (Hypothesis), 93.4% mutation kill rate (mutmut)
+
+---
+
+## Suggested Fix Directions
+
+The interleaving of two independent sync-block streams targeting different screen rows
+is the proximate cause. Three approaches to fix it:
+
+1. **Serialize the two render paths** — ensure the spinner redraw and input-area redraw
+   are never interleaved; complete one full render cycle before starting the next.
+
+2. **Wrap both redraws in a single sync envelope** — combine the spinner update and
+   input-area update under one `ESC[?2026h` … `ESC[?2026l` pair so the terminal
+   composites them atomically in one frame.
+
+3. **Throttle the spinner tick rate during compaction** — reduce the frequency at which
+   the spinner redraws so it does not interleave with input-area updates faster than
+   the terminal can composite them.
+
+---
+
+## Reference Recording
+
+A 47-minute reference ttyrec session is available on request. It contains 82,000+
+frames, 184 compaction events, and 2,466 measured flicker bursts. A marker string
+(`jfkld;sajklads;jkl;dsfjdalsk;jklasd;jklasd;`) was typed at a known point to make
+the compaction region easy to locate:
+
 ```bash
-python3 analyze-flicker.py [--db flicker.db] [~/.ttyrec/]
+iris-replay search <file> "jfkld"      # → frame ~12344
+iris-replay search <file> "Compacting" # → frames ~3492–3498 (first compaction)
 ```
-
-### Options
-- `--limit N` — process only N files (for testing)
-- `--skip-existing` — skip files already in the database (for resuming)
-- `--verbose` — print each detected event
-- `--query-only` — skip processing, show current database stats
-- `--db PATH` — SQLite database output path (default: `flicker.db`)
-
-### Example: reference file only
-```bash
-python3 analyze-flicker.py --db flicker.db --verbose \
-    ~/.ttyrec/df3cbab2-1479-11f1-bbd7-32962d695674
-```
-
----
-
-## Key Technical Notes
-
-### Why literal `\033` not ESC byte?
-The ttyrec corpus was captured from a tmux session using iris-replay. tmux's
-`%extended-output` protocol encodes ESC as literal `\033` text. When processing
-payloads, always search for the 4-byte sequence `0x5C 0x30 0x33 0x33` (backslash + "033"),
-not the ESC byte `0x1B`.
-
-### Compaction count caveat
-The `compaction_count` field uses text matching ("Compacting", "PreCompact", "Auto-compact").
-Text mentioning these words in normal conversation/output will be counted. The count is an
-upper bound on actual compaction events, not an exact count. Flicker detection is unaffected
-because it requires BOTH compaction text AND the cursor-up signal pattern.
-
-### False positive risk
-Multi-pane tmux sessions can legitimately have mixed cursor-up values from different panes
-updating concurrently (e.g., spinner pane at cursor-up 6, thinking animation at cursor-up 7).
-The current heuristic may detect some of these as false positives. The requirement for BOTH
-≥2 small and ≥2 large cursor-up values in the same window reduces but does not eliminate
-this risk.
