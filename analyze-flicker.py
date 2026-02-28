@@ -55,7 +55,8 @@ COMPACT_WORDS = [b'Compacting', b'PreCompact', b'Auto-compact']
 # Claude version pattern: e.g. /2.1.34/ or version: 2.1.34
 VERSION_RE = re.compile(
     rb'claude[- ]code[/\\ ]+(\d+\.\d+\.\d+)'
-    rb'|claude/(\d+\.\d+\.\d+)',
+    rb'|claude/(\d+\.\d+\.\d+)'
+    rb'|version[: ]+(\d+\.\d+\.\d+)',
     re.IGNORECASE,
 )
 
@@ -471,7 +472,7 @@ def find_ttyrec_files(dirs: list[str]) -> list[str]:
         if p.is_file():
             files.append(str(p))
         elif p.is_dir():
-            for f in sorted(p.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True):
+            for f in sorted(p.iterdir()):
                 if f.is_file() and (
                     f.suffix in ('.lz', '.gz')
                     or re.match(r'^[0-9a-f-]{36}$', f.name)
