@@ -53,7 +53,7 @@ Results go into a SQLite database (`flicker.db`) for querying.
 - **Zero flicker in 2.0.x**, present in every **2.1.x** sub-version tested (2.1.4 → 2.1.59)
 - **~17 flicker bursts per compaction event** in 2.1.34
 - Flicker row peaks at **3 rows** below the spinner (44.6% of events)
-- Recordings available on request (marker: `jfkld;sajklads;jkl;dsfjdalsk;jklasd;jklasd;`)
+
 
 See [flicker-report.md](flicker-report.md) for the full breakdown.
 

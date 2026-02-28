@@ -233,12 +233,7 @@ is the proximate cause. Three approaches to fix it:
 
 ## Reference Recording
 
-A 47-minute reference ttyrec session is available on request. It contains 82,000+
-frames, 184 compaction events, and 2,466 measured flicker bursts. A marker string
-(`jfkld;sajklads;jkl;dsfjdalsk;jklasd;jklasd;`) was typed at a known point to make
-the compaction region easy to locate:
-
-```bash
-iris-replay search <file> "jfkld"      # → frame ~12344
-iris-replay search <file> "Compacting" # → frames ~3492–3498 (first compaction)
-```
+A 47-minute reference ttyrec session containing 82,000+ frames, 184 compaction events,
+and 2,466 measured flicker bursts. A nonsense marker string was typed at a known frame
+(~12344) to make the compaction region easy to locate with `iris-replay search`.
+Recording snippets can be produced if needed.
