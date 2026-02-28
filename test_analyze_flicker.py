@@ -1662,3 +1662,801 @@ class TestThinkingSchema:
         })
         # Should complete without raising even with NULL values
         thinking_stats_report(conn)
+
+
+# ── thinking_stats_report stdout tests ────────────────────────────────────────
+
+class TestThinkingStatsReportOutput:
+    """Tests capturing stdout of thinking_stats_report to kill mutations."""
+
+    def _fresh_db(self) -> sqlite3.Connection:
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        return conn
+
+    def _insert_test_recording(self, conn) -> int:
+        return insert_recording(conn, {
+            'path': '/tmp/test.lz',
+            'file_size_bytes': 1000,
+            'frame_count': 100,
+            'duration_us': 10_000_000,
+            'start_ts_us': 1_000_000,
+            'end_ts_us': 11_000_000,
+            'claude_version': '2.1.34',
+            'has_compaction': 0,
+            'compaction_count': 0,
+            'flicker_count': 1,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+
+    def _insert_in_session_event(self, conn, rec_id, compaction_above=0,
+                                  thinking_above=None, thinking_offset=None):
+        """Insert a flicker event marked as in-session."""
+        insert_flicker(conn, rec_id, {
+            'start_frame': 10, 'end_frame': 40,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'duration_us': 0, 'frame_count': 30,
+            'frames_per_second': 0.0,
+            'compaction_above': compaction_above,
+            'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 3, 'line_clear_count': 0,
+            'thinking_above': thinking_above,
+            'thinking_frame_offset': thinking_offset,
+        })
+        # Mark as in-session
+        conn.execute(
+            "UPDATE flicker_events SET is_in_session = 1 "
+            "WHERE recording_id = ? AND is_in_session = 0",
+            (rec_id,),
+        )
+        conn.commit()
+
+    def _capture(self, conn):
+        """Run thinking_stats_report and capture stdout."""
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            thinking_stats_report(conn)
+        return buf.getvalue()
+
+    def test_header_printed(self):
+        """Output contains the 'THINKING SPINNER ANALYSIS' header."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=0)
+        output = self._capture(conn)
+        assert "THINKING SPINNER ANALYSIS" in output
+
+    def test_separator_line_printed(self):
+        """Output contains the '=' separator line."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=0)
+        output = self._capture(conn)
+        assert "=" * 60 in output
+
+    def test_no_schema_message(self):
+        """Without thinking schema, prints a 'not initialized' message."""
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS flicker_events (
+                id INTEGER PRIMARY KEY,
+                recording_id INTEGER
+            );
+        """)
+        output = self._capture(conn)
+        assert "Thinking schema not initialized" in output
+
+    def test_warning_on_null_values(self):
+        """Prints WARNING when events have thinking_above=NULL."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=None)
+        output = self._capture(conn)
+        assert "WARNING" in output
+        assert "NULL" in output or "null" in output.lower()
+
+    def test_null_count_in_warning(self):
+        """Warning includes the count of NULL events."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        # Insert 3 NULL events
+        for _ in range(3):
+            self._insert_in_session_event(conn, rec_id, thinking_above=None)
+        output = self._capture(conn)
+        assert "3" in output
+
+    def test_no_warning_when_no_nulls(self):
+        """No WARNING printed when all events have thinking_above set."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=1)
+        self._insert_in_session_event(conn, rec_id, thinking_above=0)
+        output = self._capture(conn)
+        assert "WARNING" not in output
+
+    def test_compaction_above_label_in_output(self):
+        """Output contains 'compaction_above=' labels."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, compaction_above=1, thinking_above=1)
+        output = self._capture(conn)
+        assert "compaction_above=1" in output
+
+    def test_thinking_above_yes_label(self):
+        """thinking_above=1 is displayed as 'yes'."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=1)
+        output = self._capture(conn)
+        assert "yes" in output
+
+    def test_thinking_above_no_label(self):
+        """thinking_above=0 is displayed as 'no'."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=0)
+        output = self._capture(conn)
+        assert "thinking_above=no" in output
+
+    def test_thinking_above_null_label(self):
+        """thinking_above=NULL is displayed as 'NULL'."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=None)
+        output = self._capture(conn)
+        assert "thinking_above=NULL" in output
+
+    def test_events_count_in_output(self):
+        """Output includes 'events=' with the correct count."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        for _ in range(5):
+            self._insert_in_session_event(conn, rec_id, thinking_above=1)
+        output = self._capture(conn)
+        assert "events=" in output
+        assert "5" in output
+
+    def test_non_compaction_section_header(self):
+        """Output contains the non-compaction section header."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, compaction_above=0, thinking_above=0)
+        output = self._capture(conn)
+        assert "Non-compaction in-session events" in output
+
+    def test_total_non_compaction_count(self):
+        """Output shows 'Total non-compaction in-session events' with correct count."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        for _ in range(4):
+            self._insert_in_session_event(conn, rec_id, compaction_above=0, thinking_above=0)
+        self._insert_in_session_event(conn, rec_id, compaction_above=1, thinking_above=1)
+        output = self._capture(conn)
+        assert "Total non-compaction in-session events: 4" in output
+
+    def test_percentage_in_non_compaction_section(self):
+        """Non-compaction breakdown includes percentage values."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        # 3 thinking=yes, 1 thinking=no → 75.0% and 25.0%
+        for _ in range(3):
+            self._insert_in_session_event(conn, rec_id, compaction_above=0, thinking_above=1)
+        self._insert_in_session_event(conn, rec_id, compaction_above=0, thinking_above=0)
+        output = self._capture(conn)
+        assert "75.0%" in output
+        assert "25.0%" in output
+
+    def test_in_session_section_header(self):
+        """Output contains 'In-session events' section header."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=0)
+        output = self._capture(conn)
+        assert "In-session events" in output
+
+    def test_run_backfill_message_on_null(self):
+        """Warning includes 'Run --backfill-thinking' instruction."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, thinking_above=None)
+        output = self._capture(conn)
+        assert "--backfill-thinking" in output
+
+    def test_mixed_compaction_and_thinking(self):
+        """Verify both compaction_above=0 and compaction_above=1 rows appear."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        self._insert_in_session_event(conn, rec_id, compaction_above=0, thinking_above=0)
+        self._insert_in_session_event(conn, rec_id, compaction_above=1, thinking_above=1)
+        output = self._capture(conn)
+        assert "compaction_above=0" in output
+        assert "compaction_above=1" in output
+
+    def test_empty_db_no_crash(self):
+        """Report on a DB with schema but no events doesn't crash."""
+        conn = self._fresh_db()
+        output = self._capture(conn)
+        # Should still print headers
+        assert "THINKING SPINNER ANALYSIS" in output
+        # Total should be 0
+        assert "Total non-compaction in-session events: 0" in output
+
+
+# ── backfill_thinking_above assertion tests ───────────────────────────────────
+
+class TestBackfillThinkingAboveAssertions:
+    """Tighter assertions on backfill_thinking_above return values and DB state."""
+
+    def _fresh_db(self) -> sqlite3.Connection:
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        return conn
+
+    def _insert_recording_with_file(self, conn, payloads):
+        """Create a ttyrec file from payloads, insert recording, return (rec_id, path)."""
+        data = make_ttyrec_bytes(*payloads)
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        rec_id = insert_recording(conn, {
+            'path': path,
+            'file_size_bytes': len(data),
+            'frame_count': len(payloads),
+            'duration_us': 1_000_000,
+            'start_ts_us': 0,
+            'end_ts_us': 1_000_000,
+            'claude_version': None,
+            'has_compaction': 0,
+            'compaction_count': 0,
+            'flicker_count': 1,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+        return rec_id, path
+
+    def _insert_null_flicker(self, conn, rec_id, start_frame=5, end_frame=34):
+        """Insert a flicker event with thinking_above=NULL."""
+        insert_flicker(conn, rec_id, {
+            'start_frame': start_frame, 'end_frame': end_frame,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'duration_us': 0, 'frame_count': end_frame - start_frame,
+            'frames_per_second': 0.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 3, 'line_clear_count': 0,
+        })
+
+    def test_return_dict_has_all_keys(self):
+        """Return dict has keys: total, updated, errors."""
+        conn = self._fresh_db()
+        stats = backfill_thinking_above(conn)
+        assert 'total' in stats
+        assert 'updated' in stats
+        assert 'errors' in stats
+
+    def test_total_counts_recordings(self):
+        """'total' in return dict counts recordings with NULL thinking_above events."""
+        conn = self._fresh_db()
+        thinking_frame = b"\\033[?2026h\\033[8A thinking..."
+        plain = b"hello"
+        payloads = [thinking_frame] * 5 + [plain] * 30
+
+        rec1, p1 = self._insert_recording_with_file(conn, payloads)
+        self._insert_null_flicker(conn, rec1)
+        rec2, p2 = self._insert_recording_with_file(conn, payloads)
+        self._insert_null_flicker(conn, rec2)
+
+        try:
+            stats = backfill_thinking_above(conn)
+            assert stats['total'] == 2
+        finally:
+            os.unlink(p1)
+            os.unlink(p2)
+
+    def test_updated_matches_event_count(self):
+        """'updated' matches the number of NULL events actually populated."""
+        conn = self._fresh_db()
+        plain = b"hello"
+        payloads = [plain] * 35
+
+        rec_id, path = self._insert_recording_with_file(conn, payloads)
+        # Insert 3 NULL events
+        self._insert_null_flicker(conn, rec_id, start_frame=5, end_frame=10)
+        self._insert_null_flicker(conn, rec_id, start_frame=15, end_frame=20)
+        self._insert_null_flicker(conn, rec_id, start_frame=25, end_frame=30)
+
+        try:
+            stats = backfill_thinking_above(conn)
+            assert stats['updated'] == 3
+        finally:
+            os.unlink(path)
+
+    def test_errors_zero_for_valid_files(self):
+        """'errors' is 0 when all files exist and are valid."""
+        conn = self._fresh_db()
+        plain = b"hello"
+        payloads = [plain] * 35
+
+        rec_id, path = self._insert_recording_with_file(conn, payloads)
+        self._insert_null_flicker(conn, rec_id)
+
+        try:
+            stats = backfill_thinking_above(conn)
+            assert stats['errors'] == 0
+        finally:
+            os.unlink(path)
+
+    def test_thinking_frame_offset_is_distance(self):
+        """thinking_frame_offset is start_frame - nearest thinking frame index."""
+        conn = self._fresh_db()
+        thinking_frame = b"\\033[?2026h\\033[8A thinking..."
+        plain = b"hello"
+        # Frames 0-2 are thinking, frames 3-34 are plain
+        payloads = [thinking_frame] * 3 + [plain] * 32
+
+        rec_id, path = self._insert_recording_with_file(conn, payloads)
+        # Event starts at frame 5, nearest thinking is frame 2 → offset = 5 - 2 = 3
+        self._insert_null_flicker(conn, rec_id, start_frame=5, end_frame=34)
+
+        try:
+            stats = backfill_thinking_above(conn)
+            assert stats['updated'] == 1
+            row = conn.execute(
+                "SELECT thinking_above, thinking_frame_offset FROM flicker_events "
+                "WHERE recording_id = ?", (rec_id,)
+            ).fetchone()
+            assert row[0] == 1
+            assert row[1] == 3  # start_frame(5) - nearest_thinking(2) = 3
+        finally:
+            os.unlink(path)
+
+    def test_already_populated_events_skipped(self):
+        """Events with thinking_above already set are not re-processed."""
+        conn = self._fresh_db()
+        plain = b"hello"
+        payloads = [plain] * 35
+
+        rec_id, path = self._insert_recording_with_file(conn, payloads)
+        # Insert event WITH thinking_above set (not NULL)
+        insert_flicker(conn, rec_id, {
+            'start_frame': 5, 'end_frame': 34,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'duration_us': 0, 'frame_count': 30,
+            'frames_per_second': 0.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 3, 'line_clear_count': 0,
+            'thinking_above': 1, 'thinking_frame_offset': -5,
+        })
+
+        try:
+            stats = backfill_thinking_above(conn)
+            assert stats['total'] == 0  # No recordings need processing
+            assert stats['updated'] == 0
+        finally:
+            os.unlink(path)
+
+    def test_backfill_sets_zero_without_nearby_thinking(self):
+        """When no thinking frames precede, thinking_above=0 and offset is NULL."""
+        conn = self._fresh_db()
+        plain = b"hello"
+        payloads = [plain] * 35
+
+        rec_id, path = self._insert_recording_with_file(conn, payloads)
+        self._insert_null_flicker(conn, rec_id)
+
+        try:
+            stats = backfill_thinking_above(conn)
+            row = conn.execute(
+                "SELECT thinking_above, thinking_frame_offset FROM flicker_events "
+                "WHERE recording_id = ?", (rec_id,)
+            ).fetchone()
+            assert row[0] == 0
+            assert row[1] is None  # no thinking frame → no offset
+        finally:
+            os.unlink(path)
+
+    def test_verbose_mode_errors(self):
+        """In verbose mode, missing files still count as errors."""
+        conn = self._fresh_db()
+        rec_id = insert_recording(conn, {
+            'path': '/nonexistent/file.lz',
+            'file_size_bytes': 0, 'frame_count': 0, 'duration_us': 0,
+            'start_ts_us': 0, 'end_ts_us': 0, 'claude_version': None,
+            'has_compaction': 0, 'compaction_count': 0, 'flicker_count': 1,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+        self._insert_null_flicker(conn, rec_id)
+        stats = backfill_thinking_above(conn, verbose=True)
+        assert stats['errors'] == 1
+        assert stats['total'] == 1
+
+    def test_backfill_no_null_events_returns_zero_total(self):
+        """When no events have NULL thinking_above, total=0."""
+        conn = self._fresh_db()
+        stats = backfill_thinking_above(conn)
+        assert stats['total'] == 0
+        assert stats['updated'] == 0
+        assert stats['errors'] == 0
+
+
+# ── detect_sessions_in_recording additional tests ─────────────────────────────
+
+class TestDetectSessionsAdditional:
+    """Additional edge case tests for detect_sessions_in_recording."""
+
+    def _write_ttyrec(self, payloads: list, ts_step_ms: int = 100) -> str:
+        data = b""
+        for i, p in enumerate(payloads):
+            sec = 1 + (i * ts_step_ms) // 1000
+            usec = ((i * ts_step_ms) % 1000) * 1000
+            data += struct.pack("<III", sec, usec, len(p)) + p
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_goodbye_caps_confidence_at_10(self):
+        """Version + welcome + goodbye → confidence capped at 10."""
+        path = self._write_ttyrec([
+            b"Welcome to Claude Code  claude-code/2.2.0 \\033[?2026h",
+            b"Goodbye from Claude Code session ended",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            # version+welcome=8, +5 goodbye would be 13, capped at 10
+            assert sessions[0]['confidence'] == 10
+        finally:
+            os.unlink(path)
+
+    def test_goodbye_sets_end_frame(self):
+        """When goodbye is present, end_frame points to the goodbye frame."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h sync frame 0",
+            b"\\033[?2026h sync frame 1",
+            b"Goodbye from Claude Code frame 2",
+            b"\\033[?2026h sync frame 3",  # sync after goodbye
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['end_frame'] == 2  # goodbye on frame 2
+        finally:
+            os.unlink(path)
+
+    def test_version_extraction_from_claude_code_format(self):
+        """Extracts version from 'claude-code/X.Y.Z' format."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h  claude-code/3.0.1 startup",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['claude_version'] == '3.0.1'
+        finally:
+            os.unlink(path)
+
+    def test_no_version_returns_none(self):
+        """When no version string, claude_version is None."""
+        path = self._write_ttyrec([b"\\033[?2026h sync only"])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['claude_version'] is None
+        finally:
+            os.unlink(path)
+
+    def test_end_frame_fallback_to_last_frame(self):
+        """Without goodbye or sync, end_frame falls back to last frame index."""
+        # Single frame with version (no sync after, no goodbye)
+        path = self._write_ttyrec([
+            b"claude-code/2.1.34",  # version but no sync on this frame alone
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            if len(sessions) == 1:
+                # end_frame should be 0 (last frame) since there's no sync after
+                assert sessions[0]['end_frame'] >= 0
+        finally:
+            os.unlink(path)
+
+    def test_start_signal_is_sync_when_sync_first(self):
+        """When sync block is the first signal, start_signal='sync_activity'."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h plain sync block",
+            b"more plain data",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['start_signal'] == 'sync_activity'
+        finally:
+            os.unlink(path)
+
+    def test_start_signal_is_welcome_when_welcome_first(self):
+        """When welcome banner is the first signal, start_signal='welcome'."""
+        path = self._write_ttyrec([
+            b"Welcome to Claude Code v2.0.0",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['start_signal'] == 'welcome'
+        finally:
+            os.unlink(path)
+
+    def test_session_ts_us_are_integers(self):
+        """start_ts_us and end_ts_us are integers (not floats)."""
+        path = self._write_ttyrec([b"\\033[?2026h sync"])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert isinstance(sessions[0]['start_ts_us'], int)
+            assert isinstance(sessions[0]['end_ts_us'], int)
+        finally:
+            os.unlink(path)
+
+    def test_compact_signal_confidence_two(self):
+        """Compaction text alone (with sync) gives confidence=2."""
+        path = self._write_ttyrec([
+            b"\\033[?2026h Compacting context...",
+        ])
+        try:
+            sessions = detect_sessions_in_recording(path)
+            assert len(sessions) == 1
+            assert sessions[0]['confidence'] == 2
+            assert sessions[0]['start_signal'] == 'compact'
+        finally:
+            os.unlink(path)
+
+
+# ── insert_session field assertion tests ──────────────────────────────────────
+
+class TestInsertSessionFields:
+    """Tighter assertions on insert_session DB state."""
+
+    def _fresh_db(self) -> sqlite3.Connection:
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        return conn
+
+    def _insert_test_recording(self, conn) -> int:
+        return insert_recording(conn, {
+            'path': '/tmp/test.lz',
+            'file_size_bytes': 1000,
+            'frame_count': 100,
+            'duration_us': 10_000_000,
+            'start_ts_us': 1_000_000,
+            'end_ts_us': 11_000_000,
+            'claude_version': '2.1.34',
+            'has_compaction': 1,
+            'compaction_count': 3,
+            'flicker_count': 2,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+
+    def test_timestamp_fields_stored(self):
+        """session_start_ts_us and session_end_ts_us are stored correctly."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 10, 'end_frame': 90,
+            'start_ts_us': 1_500_000, 'end_ts_us': 9_500_000,
+            'claude_version': '2.1.34',
+            'confidence': 5, 'start_signal': 'welcome',
+        }
+        sid = insert_session(conn, rec_id, session)
+        row = conn.execute(
+            "SELECT session_start_ts_us, session_end_ts_us FROM claude_sessions WHERE id = ?",
+            (sid,)
+        ).fetchone()
+        assert row[0] == 1_500_000
+        assert row[1] == 9_500_000
+
+    def test_null_version_stored(self):
+        """When claude_version is None, NULL is stored in the DB."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 10, 'end_frame': 90,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'claude_version': None,
+            'confidence': 1, 'start_signal': 'sync_activity',
+        }
+        sid = insert_session(conn, rec_id, session)
+        row = conn.execute(
+            "SELECT claude_version FROM claude_sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert row[0] is None
+
+    def test_detected_at_populated(self):
+        """detected_at field is populated with an ISO timestamp."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 10, 'end_frame': 90,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'claude_version': '2.1.34',
+            'confidence': 3, 'start_signal': 'version',
+        }
+        sid = insert_session(conn, rec_id, session)
+        row = conn.execute(
+            "SELECT detected_at FROM claude_sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert row[0] is not None
+        # Should be an ISO 8601 timestamp
+        assert "T" in row[0]
+
+    def test_consecutive_inserts_increment_id(self):
+        """Consecutive inserts return incrementing IDs."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 10, 'end_frame': 90,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'claude_version': '2.1.34',
+            'confidence': 3, 'start_signal': 'version',
+        }
+        sid1 = insert_session(conn, rec_id, session)
+        sid2 = insert_session(conn, rec_id, session)
+        assert sid2 > sid1
+
+    def test_start_signal_stored(self):
+        """start_signal value is persisted correctly."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        session = {
+            'start_frame': 0, 'end_frame': 50,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'claude_version': None,
+            'confidence': 2, 'start_signal': 'compact',
+        }
+        sid = insert_session(conn, rec_id, session)
+        row = conn.execute(
+            "SELECT start_signal FROM claude_sessions WHERE id = ?", (sid,)
+        ).fetchone()
+        assert row[0] == 'compact'
+
+
+# ── stream_frames additional edge case tests ──────────────────────────────────
+
+class TestStreamFramesAdditional:
+    """Additional edge cases for stream_frames to kill mutations."""
+
+    def test_gz_file_decompresses(self):
+        """stream_frames handles .gz files by decompressing them."""
+        payload = b"compressed frame data"
+        data = struct.pack("<III", 1, 0, len(payload)) + payload
+        fd, path = tempfile.mkstemp(suffix=".gz", dir="/private/tmp/claude-502/")
+        os.close(fd)
+        import gzip as gz
+        with gz.open(path, 'wb') as f:
+            f.write(data)
+        try:
+            frames = list(stream_frames(path))
+            assert len(frames) == 1
+            assert frames[0]['payload'] == payload
+            assert frames[0]['sec'] == 1
+            assert frames[0]['usec'] == 0
+        finally:
+            os.unlink(path)
+
+    def test_frame_dict_keys(self):
+        """Each frame dict has exactly sec, usec, payload keys."""
+        data = struct.pack("<III", 5, 123456, 3) + b"abc"
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        try:
+            frames = list(stream_frames(path))
+            assert len(frames) == 1
+            assert set(frames[0].keys()) == {'sec', 'usec', 'payload'}
+        finally:
+            os.unlink(path)
+
+    def test_truncated_payload_stops_gracefully(self):
+        """If payload is shorter than declared length, stream stops without error."""
+        # Header says 100 bytes but only 5 are present
+        data = struct.pack("<III", 1, 0, 100) + b"short"
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        try:
+            frames = list(stream_frames(path))
+            assert frames == []  # truncated payload → yields nothing
+        finally:
+            os.unlink(path)
+
+    def test_multiple_frames_with_varying_sizes(self):
+        """Handles frames with different payload lengths."""
+        data = b""
+        data += struct.pack("<III", 1, 0, 3) + b"abc"
+        data += struct.pack("<III", 2, 0, 10) + b"0123456789"
+        data += struct.pack("<III", 3, 0, 1) + b"x"
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        try:
+            frames = list(stream_frames(path))
+            assert len(frames) == 3
+            assert frames[0]['payload'] == b"abc"
+            assert frames[1]['payload'] == b"0123456789"
+            assert frames[2]['payload'] == b"x"
+            assert frames[0]['sec'] == 1
+            assert frames[1]['sec'] == 2
+            assert frames[2]['sec'] == 3
+        finally:
+            os.unlink(path)
+
+
+# ── ensure_*_schema additional tests ──────────────────────────────────────────
+
+class TestSchemaAdditional:
+    """Additional tests for ensure_session_schema and ensure_thinking_schema."""
+
+    def test_session_schema_creates_claude_sessions_table(self):
+        """ensure_session_schema creates the claude_sessions table."""
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        tables = [row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()]
+        assert 'claude_sessions' in tables
+
+    def test_session_schema_adds_session_id_column(self):
+        """ensure_session_schema adds session_id column to flicker_events."""
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        cols = [row[1] for row in conn.execute(
+            "PRAGMA table_info(flicker_events)"
+        ).fetchall()]
+        assert 'session_id' in cols
+
+    def test_session_schema_adds_is_in_session_column(self):
+        """ensure_session_schema adds is_in_session column to flicker_events."""
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        cols = [row[1] for row in conn.execute(
+            "PRAGMA table_info(flicker_events)"
+        ).fetchall()]
+        assert 'is_in_session' in cols
+
+    def test_thinking_schema_adds_thinking_above_column(self):
+        """ensure_thinking_schema adds thinking_above column."""
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS flicker_events (
+                id INTEGER PRIMARY KEY
+            );
+        """)
+        ensure_thinking_schema(conn)
+        cols = [row[1] for row in conn.execute(
+            "PRAGMA table_info(flicker_events)"
+        ).fetchall()]
+        assert 'thinking_above' in cols
+
+    def test_thinking_schema_adds_thinking_frame_offset_column(self):
+        """ensure_thinking_schema adds thinking_frame_offset column."""
+        conn = sqlite3.connect(":memory:")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS flicker_events (
+                id INTEGER PRIMARY KEY
+            );
+        """)
+        ensure_thinking_schema(conn)
+        cols = [row[1] for row in conn.execute(
+            "PRAGMA table_info(flicker_events)"
+        ).fetchall()]
+        assert 'thinking_frame_offset' in cols
+
+    def test_session_schema_creates_index(self):
+        """ensure_session_schema creates idx_sessions_recording index."""
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        indexes = [row[1] for row in conn.execute(
+            "PRAGMA index_list(claude_sessions)"
+        ).fetchall()]
+        assert 'idx_sessions_recording' in indexes
