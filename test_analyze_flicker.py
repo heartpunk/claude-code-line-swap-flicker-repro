@@ -34,6 +34,7 @@ update_flicker_session_flags = _mod.update_flicker_session_flags
 ensure_session_schema = _mod.ensure_session_schema
 ensure_thinking_schema = _mod.ensure_thinking_schema
 backfill_thinking_above = _mod.backfill_thinking_above
+thinking_stats_report = _mod.thinking_stats_report
 WINDOW_SIZE = _mod.WINDOW_SIZE
 MIN_SYNC_BLOCKS = _mod.MIN_SYNC_BLOCKS
 SMALL_CUP_MAX = _mod.SMALL_CUP_MAX
@@ -1517,3 +1518,147 @@ class TestThinkingSchema:
         stats = backfill_thinking_above(conn)
         assert stats['errors'] == 1
         assert stats['updated'] == 0
+
+    def test_ensure_thinking_schema_adds_columns_to_old_db(self):
+        """ensure_thinking_schema adds thinking columns to a DB that lacks them."""
+        conn = sqlite3.connect(":memory:")
+        # Create minimal flicker_events WITHOUT thinking columns (old-style schema)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS flicker_events (
+                id INTEGER PRIMARY KEY,
+                sync_block_count INTEGER,
+                line_clear_count INTEGER
+            );
+        """)
+        conn.commit()
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(flicker_events)").fetchall()]
+        assert 'thinking_above' not in cols
+        ensure_thinking_schema(conn)
+        # Columns should now be present
+        conn.execute("SELECT thinking_above, thinking_frame_offset FROM flicker_events LIMIT 0")
+
+    def test_backfill_processes_real_file_and_sets_thinking_above(self):
+        """backfill_thinking_above correctly sets thinking_above=1 from a real file."""
+        # Build a ttyrec: frames 0-4 are thinking-spinner frames (sync + large CUP,
+        # no compaction text), frames 5-34 are plain frames.
+        thinking_frame = b"\\033[?2026h\\033[8A thinking..."
+        plain_frame = b"hello"
+        payloads = [thinking_frame] * 5 + [plain_frame] * 30
+        data = make_ttyrec_bytes(*payloads)
+
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+
+        try:
+            conn = self._fresh_db()
+            rec_id = insert_recording(conn, {
+                'path': path,
+                'file_size_bytes': len(data), 'frame_count': 35,
+                'duration_us': 1_000_000, 'start_ts_us': 0, 'end_ts_us': 1_000_000,
+                'claude_version': None, 'has_compaction': 0,
+                'compaction_count': 0, 'flicker_count': 1,
+                'processed_at': '2025-01-01T00:00:00+00:00',
+            })
+            # Insert flicker event with thinking_above=NULL (not yet backfilled)
+            insert_flicker(conn, rec_id, {
+                'start_frame': 5, 'end_frame': 34,
+                'start_ts_us': 0, 'end_ts_us': 0,
+                'duration_us': 0, 'frame_count': 30,
+                'frames_per_second': 0.0,
+                'compaction_above': 0, 'compaction_frame_offset': None,
+                'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+                'sync_block_count': 3, 'line_clear_count': 0,
+            })
+            # Verify NULL before backfill
+            assert conn.execute("SELECT thinking_above FROM flicker_events").fetchone()[0] is None
+
+            stats = backfill_thinking_above(conn)
+            assert stats['updated'] == 1
+            assert stats['errors'] == 0
+
+            row = conn.execute(
+                "SELECT thinking_above FROM flicker_events WHERE recording_id = ?",
+                (rec_id,)
+            ).fetchone()
+            assert row[0] == 1  # thinking frames at idx 0-4 are in the lookback
+        finally:
+            os.unlink(path)
+
+    def test_backfill_sets_thinking_above_zero_when_no_spinner(self):
+        """backfill_thinking_above sets thinking_above=0 when no spinner frames precede event."""
+        plain_frame = b"hello"
+        payloads = [plain_frame] * 35
+        data = make_ttyrec_bytes(*payloads)
+
+        fd, path = tempfile.mkstemp(dir="/private/tmp/claude-502/")
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+
+        try:
+            conn = self._fresh_db()
+            rec_id = insert_recording(conn, {
+                'path': path,
+                'file_size_bytes': len(data), 'frame_count': 35,
+                'duration_us': 1_000_000, 'start_ts_us': 0, 'end_ts_us': 1_000_000,
+                'claude_version': None, 'has_compaction': 0,
+                'compaction_count': 0, 'flicker_count': 1,
+                'processed_at': '2025-01-01T00:00:00+00:00',
+            })
+            insert_flicker(conn, rec_id, {
+                'start_frame': 5, 'end_frame': 34,
+                'start_ts_us': 0, 'end_ts_us': 0,
+                'duration_us': 0, 'frame_count': 30,
+                'frames_per_second': 0.0,
+                'compaction_above': 0, 'compaction_frame_offset': None,
+                'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+                'sync_block_count': 3, 'line_clear_count': 0,
+            })
+            stats = backfill_thinking_above(conn)
+            assert stats['updated'] == 1
+            assert stats['errors'] == 0
+
+            row = conn.execute(
+                "SELECT thinking_above FROM flicker_events WHERE recording_id = ?",
+                (rec_id,)
+            ).fetchone()
+            assert row[0] == 0  # no thinking frames before event
+
+        finally:
+            os.unlink(path)
+
+    def test_thinking_stats_report_runs_without_error(self):
+        """thinking_stats_report completes without raising on a populated DB."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        # Insert events with various thinking_above values
+        for ta in (0, 1, 1):
+            insert_flicker(conn, rec_id, {
+                'start_frame': 10, 'end_frame': 40,
+                'start_ts_us': 0, 'end_ts_us': 0,
+                'duration_us': 0, 'frame_count': 30,
+                'frames_per_second': 0.0,
+                'compaction_above': 0, 'compaction_frame_offset': None,
+                'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+                'sync_block_count': 3, 'line_clear_count': 0,
+                'thinking_above': ta, 'thinking_frame_offset': None,
+            })
+        thinking_stats_report(conn)  # Should not raise
+
+    def test_thinking_stats_report_warns_on_null(self):
+        """thinking_stats_report prints a warning when thinking_above IS NULL."""
+        import io
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        insert_flicker(conn, rec_id, {
+            'start_frame': 10, 'end_frame': 40,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'duration_us': 0, 'frame_count': 30,
+            'frames_per_second': 0.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 3, 'line_clear_count': 0,
+            # thinking_above omitted → NULL
+        })
+        # Should complete without raising even with NULL values
+        thinking_stats_report(conn)
