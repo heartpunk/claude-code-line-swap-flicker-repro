@@ -25,6 +25,8 @@ spanning mid-2025 through February 2026. Key numbers:
 - **71% of events** occur during detected compaction; the remaining **29% occur during
   other Claude Code spinner animations** (thinking, tool-use) — same root cause, broader
   trigger surface than previously described
+- **99.98% of non-compaction events** have a co-occurring thinking/tool-use spinner
+  (`thinking_above=1`); only 3 of 16,897 events have neither compaction nor spinner context
 - **Zero flicker in any 2.0.x session** tested
 - Bug present in every 2.1.x sub-version from 2.1.4 through 2.1.59 (latest in corpus)
 
@@ -233,6 +235,33 @@ with small cursor-up from another). The `08923efa` mystery file is a long record
 that mixes genuine Claude Code sessions with system-monitor content in the same
 ttyrec; the Claude Code portions show true flicker.
 
+### Stage 5: Thinking Spinner Confirmation
+
+A structural detector was added to identify "thinking/tool-use spinner frames":
+any frame with a sync block **and** large cursor-up (≥6) **but without** compaction
+text.  This is analogous to how compaction frames are detected but excludes the
+compaction path.
+
+Running a `thinking_above` backfill over all 58,692 corpus events produced:
+
+| compaction_above | thinking_above | Events |
+|---|---|---|
+| 1 (compaction) | yes | 41,786 |
+| 0 (no compaction) | yes | **16,894** |
+| 0 (no compaction) | **no** | **3** |
+
+**16,894 / 16,897 (99.98%) of non-compaction in-session events have a co-occurring
+thinking/tool-use spinner.** The remaining 3 events are statistical noise — likely
+edge cases in the 600-frame lookback window.
+
+The 41,786 compaction-above events also showing `thinking_above=1` reflects that
+thinking spinners often run in the 600-frame window immediately preceding or
+surrounding compaction — Claude is thinking, context fills up, then compaction fires.
+
+**Conclusion:** The flicker bug fires whenever **any** Claude Code spinner animation
+(compaction or thinking/tool-use) runs concurrently with input-area redraws.  The
+trigger surface is not limited to compaction.
+
 ---
 
 ## Detection Methodology
@@ -262,7 +291,7 @@ render pattern.
 - Heuristic tuned against a reference 47-minute session (`df3cbab2-...`) with a typed
   marker string to locate the compaction region precisely
 - Spot-checked with `ipbt` frame-by-frame visual rendering
-- Test suite: 117 unit + property tests (Hypothesis), 93.4% mutation kill rate (mutmut)
+- Test suite: 138 unit + property tests (Hypothesis), 93.4% mutation kill rate (mutmut)
 
 ---
 

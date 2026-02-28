@@ -156,11 +156,26 @@ def extract_features(frame: dict) -> dict:
     }
 
 
+def is_thinking_spinner_frame(feat: dict) -> bool:
+    """Return True if this frame looks like a thinking/tool-use spinner frame.
+
+    A thinking spinner frame has sync blocks and large cursor-up (like a
+    compaction spinner) but does NOT contain compaction text.  This covers
+    Claude Code's thinking/tool-use animation that triggers the same visual bug.
+    """
+    return (
+        feat['sync_count'] > 0
+        and any(v >= LARGE_CUP_MIN for v in feat['cup_values'])
+        and not feat['is_compact']
+    )
+
+
 # ── Flicker heuristic ────────────────────────────────────────────────────────
 
 WINDOW_SIZE = 30          # frames in sliding window
 MAX_WINDOW_SECS = 2.5     # max wall-clock span of window
 COMPACT_LOOKBACK = 600    # frames to look back for compaction context
+THINKING_LOOKBACK = COMPACT_LOOKBACK  # same lookback for thinking/tool-use spinners
 
 # Thresholds
 MIN_SYNC_BLOCKS   = 3     # minimum sync starts in window
@@ -228,6 +243,7 @@ def extract_event_metadata(
     window: collections.deque,
     compact_history: collections.deque,
     file_start_idx: int,
+    thinking_history: collections.deque = None,
 ) -> dict:
     """Build metadata dict for a confirmed flicker event."""
     frames = list(window)
@@ -267,6 +283,16 @@ def extract_event_metadata(
 
     compaction_above = nearest_compact_dist is not None
 
+    # Nearest thinking/tool-use spinner frame
+    nearest_thinking_dist = None
+    if thinking_history is not None:
+        for ti in thinking_history:
+            dist = start_idx - ti
+            if nearest_thinking_dist is None or abs(dist) < abs(nearest_thinking_dist):
+                nearest_thinking_dist = dist
+
+    thinking_above = nearest_thinking_dist is not None
+
     return {
         'start_frame': start_idx,
         'end_frame': end_idx,
@@ -281,6 +307,8 @@ def extract_event_metadata(
         'cursor_up_spinner': dominant_large,
         'sync_block_count': total_sync,
         'line_clear_count': clear_total,
+        'thinking_above': 1 if thinking_above else 0,
+        'thinking_frame_offset': nearest_thinking_dist,
     }
 
 
@@ -317,7 +345,9 @@ CREATE TABLE IF NOT EXISTS flicker_events (
     cursor_up_rows INTEGER,
     cursor_up_spinner INTEGER,
     sync_block_count INTEGER,
-    line_clear_count INTEGER
+    line_clear_count INTEGER,
+    thinking_above INTEGER,
+    thinking_frame_offset INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_flicker_recording ON flicker_events(recording_id);
@@ -345,6 +375,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_recording ON claude_sessions(recording_i
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(SCHEMA)
+    ensure_thinking_schema(conn)  # migration for existing DBs
     conn.commit()
     return conn
 
@@ -356,6 +387,19 @@ def ensure_session_schema(conn: sqlite3.Connection):
     for col_def in [
         "ALTER TABLE flicker_events ADD COLUMN session_id INTEGER REFERENCES claude_sessions(id)",
         "ALTER TABLE flicker_events ADD COLUMN is_in_session INTEGER DEFAULT 0",
+    ]:
+        try:
+            conn.execute(col_def)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+
+def ensure_thinking_schema(conn: sqlite3.Connection):
+    """Add thinking_above and thinking_frame_offset to flicker_events if not present."""
+    for col_def in [
+        "ALTER TABLE flicker_events ADD COLUMN thinking_above INTEGER",
+        "ALTER TABLE flicker_events ADD COLUMN thinking_frame_offset INTEGER",
     ]:
         try:
             conn.execute(col_def)
@@ -393,8 +437,9 @@ def insert_flicker(conn, recording_id: int, event: dict):
              duration_us, frame_count, frames_per_second,
              compaction_above, compaction_frame_offset,
              cursor_up_rows, cursor_up_spinner,
-             sync_block_count, line_clear_count)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             sync_block_count, line_clear_count,
+             thinking_above, thinking_frame_offset)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             recording_id,
@@ -405,6 +450,7 @@ def insert_flicker(conn, recording_id: int, event: dict):
             event['compaction_above'], event['compaction_frame_offset'],
             event['cursor_up_rows'], event['cursor_up_spinner'],
             event['sync_block_count'], event['line_clear_count'],
+            event.get('thinking_above'), event.get('thinking_frame_offset'),
         ),
     )
     conn.commit()
@@ -752,6 +798,167 @@ def session_stats_report(conn: sqlite3.Connection):
         print(f"  {row[2]:5d}x  {row[1] or '?':10s}  {os.path.basename(row[0])}")
 
 
+# ── Thinking backfill + report ───────────────────────────────────────────────
+
+def backfill_thinking_above(conn: sqlite3.Connection, verbose: bool = False) -> dict:
+    """
+    Re-read all recordings that have flicker events with thinking_above IS NULL
+    and populate thinking_above / thinking_frame_offset for each.
+
+    Returns summary stats dict with keys: total, updated, errors.
+    """
+    ensure_thinking_schema(conn)
+
+    rows = conn.execute(
+        """
+        SELECT DISTINCT r.id, r.path
+        FROM recordings r
+        JOIN flicker_events f ON f.recording_id = r.id
+        WHERE f.thinking_above IS NULL
+        ORDER BY r.id
+        """
+    ).fetchall()
+
+    total = len(rows)
+    print(f"Backfilling thinking_above for {total} recordings...")
+
+    updated = 0
+    errors = 0
+    t_start = time.monotonic()
+
+    for i, (rec_id, path) in enumerate(rows, 1):
+        if not verbose:
+            elapsed = time.monotonic() - t_start
+            rate = i / elapsed if elapsed > 0 else 0
+            eta = (total - i) / rate if rate > 0 else 0
+            print(
+                f"\r  [{i:4d}/{total}] {100*i/total:5.1f}%  "
+                f"updated={updated}  errors={errors}  "
+                f"rate={rate:.1f}/s  eta={eta:.0f}s    ",
+                end='', flush=True,
+            )
+
+        if not os.path.exists(path):
+            if verbose:
+                print(f"  SKIP (missing): {os.path.basename(path)}")
+            errors += 1
+            continue
+
+        events = conn.execute(
+            """
+            SELECT id, start_frame, end_frame
+            FROM flicker_events
+            WHERE recording_id = ? AND thinking_above IS NULL
+            ORDER BY end_frame
+            """,
+            (rec_id,),
+        ).fetchall()
+
+        if not events:
+            continue
+
+        # Map end_frame → list of (eid, start_frame) for events at that frame
+        end_map: dict = {}
+        for eid, start_frame, end_frame in events:
+            end_map.setdefault(end_frame, []).append((eid, start_frame))
+        max_end = max(end_map)
+
+        thinking_history: collections.deque = collections.deque(maxlen=THINKING_LOOKBACK)
+
+        try:
+            for frame_idx, frame in enumerate(stream_frames(path)):
+                if frame_idx > max_end + THINKING_LOOKBACK:
+                    break
+
+                feat = extract_features(frame)
+                if is_thinking_spinner_frame(feat):
+                    thinking_history.append(frame_idx)
+
+                if frame_idx in end_map:
+                    for eid, start_frame in end_map[frame_idx]:
+                        nearest_dist = None
+                        for ti in thinking_history:
+                            dist = start_frame - ti
+                            if nearest_dist is None or abs(dist) < abs(nearest_dist):
+                                nearest_dist = dist
+                        thinking_above = 1 if nearest_dist is not None else 0
+                        conn.execute(
+                            """
+                            UPDATE flicker_events
+                            SET thinking_above = ?, thinking_frame_offset = ?
+                            WHERE id = ?
+                            """,
+                            (thinking_above, nearest_dist, eid),
+                        )
+                        updated += 1
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"\n  ERROR {os.path.basename(path)}: {exc}", file=sys.stderr)
+            errors += 1
+
+    if not verbose:
+        print()
+
+    return {'total': total, 'updated': updated, 'errors': errors}
+
+
+def thinking_stats_report(conn: sqlite3.Connection):
+    """Show thinking_above breakdown for in-session flicker events."""
+    print("\n" + "=" * 60)
+    print("THINKING SPINNER ANALYSIS")
+    print("=" * 60)
+
+    try:
+        conn.execute("SELECT thinking_above FROM flicker_events LIMIT 1")
+    except sqlite3.OperationalError:
+        print("Thinking schema not initialized. Run --backfill-thinking first.")
+        return
+
+    null_count = conn.execute(
+        "SELECT COUNT(*) FROM flicker_events WHERE thinking_above IS NULL"
+    ).fetchone()[0]
+    if null_count:
+        print(f"\n  WARNING: {null_count} events still have thinking_above=NULL")
+        print("  Run --backfill-thinking to populate them.")
+
+    print("\n-- In-session events: compaction_above × thinking_above --")
+    for row in conn.execute(
+        """
+        SELECT compaction_above, COALESCE(thinking_above, -1), COUNT(*)
+        FROM flicker_events
+        WHERE COALESCE(is_in_session, 0) = 1
+        GROUP BY compaction_above, COALESCE(thinking_above, -1)
+        ORDER BY compaction_above DESC, COALESCE(thinking_above, -1) DESC
+        """
+    ):
+        thinking_label = {1: 'yes', 0: 'no', -1: 'NULL'}[row[1]]
+        print(
+            f"  compaction_above={row[0]}  thinking_above={thinking_label:4s}  "
+            f"events={row[2]:6d}"
+        )
+
+    print("\n-- Non-compaction in-session events: thinking_above breakdown --")
+    total_nc = conn.execute(
+        "SELECT COUNT(*) FROM flicker_events WHERE COALESCE(is_in_session,0)=1 AND compaction_above=0"
+    ).fetchone()[0]
+    for row in conn.execute(
+        """
+        SELECT COALESCE(thinking_above, -1), COUNT(*)
+        FROM flicker_events
+        WHERE COALESCE(is_in_session, 0) = 1 AND compaction_above = 0
+        GROUP BY COALESCE(thinking_above, -1)
+        ORDER BY COALESCE(thinking_above, -1) DESC
+        """
+    ):
+        thinking_label = {1: 'yes', 0: 'no', -1: 'NULL'}[row[0]]
+        pct = 100 * row[1] / total_nc if total_nc else 0
+        print(
+            f"  thinking_above={thinking_label:4s}  events={row[1]:6d}  ({pct:.1f}%)"
+        )
+
+    print(f"\n  Total non-compaction in-session events: {total_nc}")
+
+
 # ── Per-file analysis ─────────────────────────────────────────────────────────
 
 def analyze_file(path: str, conn: sqlite3.Connection, verbose: bool = False):
@@ -760,6 +967,7 @@ def analyze_file(path: str, conn: sqlite3.Connection, verbose: bool = False):
 
     window: collections.deque = collections.deque(maxlen=WINDOW_SIZE)
     compact_history: collections.deque = collections.deque(maxlen=COMPACT_LOOKBACK)
+    thinking_history: collections.deque = collections.deque(maxlen=THINKING_LOOKBACK)
 
     claude_version = None
     frame_count = 0
@@ -789,6 +997,10 @@ def analyze_file(path: str, conn: sqlite3.Connection, verbose: bool = False):
                 if not window or not any(f['is_compact'] for _, f in window):
                     compaction_count += 1
 
+            # Track thinking/tool-use spinner frames
+            if is_thinking_spinner_frame(feat):
+                thinking_history.append(frame_count)
+
             window.append((frame_count, feat))
 
             # Evaluate flicker heuristic once window is full
@@ -798,7 +1010,7 @@ def analyze_file(path: str, conn: sqlite3.Connection, verbose: bool = False):
             ):
                 if meets_flicker_heuristics(window, compact_history, frame_count):
                     event = extract_event_metadata(
-                        window, compact_history, frame_count
+                        window, compact_history, frame_count, thinking_history
                     )
                     flicker_events_buf.append(event)
                     last_flicker_end = frame_count
@@ -951,6 +1163,10 @@ def main():
                         help='Show session-filtered statistics')
     parser.add_argument('--flicker-only', action='store_true',
                         help='With --detect-sessions: only process recordings with flicker events')
+    parser.add_argument('--backfill-thinking', action='store_true',
+                        help='Backfill thinking_above for existing flicker events')
+    parser.add_argument('--thinking-report', action='store_true',
+                        help='Show thinking spinner breakdown for in-session events')
     args = parser.parse_args()
 
     conn = init_db(args.db)
@@ -971,6 +1187,24 @@ def main():
         if args.session_report:
             session_stats_report(conn)
         conn.close()
+        return
+
+    if args.backfill_thinking:
+        stats = backfill_thinking_above(conn, verbose=args.verbose)
+        print(
+            f"\nBackfill complete: "
+            f"recordings={stats['total']}  updated={stats['updated']}  errors={stats['errors']}"
+        )
+        if args.thinking_report:
+            thinking_stats_report(conn)
+        conn.close()
+        return
+
+    if args.thinking_report:
+        try:
+            thinking_stats_report(conn)
+        finally:
+            conn.close()
         return
 
     if args.session_report:

@@ -18,6 +18,7 @@ import pytest
 import analyze_flicker as _mod
 
 extract_features = _mod.extract_features
+is_thinking_spinner_frame = _mod.is_thinking_spinner_frame
 meets_flicker_heuristics = _mod.meets_flicker_heuristics
 extract_event_metadata = _mod.extract_event_metadata
 stream_frames = _mod.stream_frames
@@ -31,6 +32,8 @@ detect_sessions_in_recording = _mod.detect_sessions_in_recording
 insert_session = _mod.insert_session
 update_flicker_session_flags = _mod.update_flicker_session_flags
 ensure_session_schema = _mod.ensure_session_schema
+ensure_thinking_schema = _mod.ensure_thinking_schema
+backfill_thinking_above = _mod.backfill_thinking_above
 WINDOW_SIZE = _mod.WINDOW_SIZE
 MIN_SYNC_BLOCKS = _mod.MIN_SYNC_BLOCKS
 SMALL_CUP_MAX = _mod.SMALL_CUP_MAX
@@ -1284,3 +1287,233 @@ class TestSessionDbOps:
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='claude_sessions'"
         ).fetchone()[0]
         assert count == 1
+
+
+# ── is_thinking_spinner_frame tests ──────────────────────────────────────────
+
+class TestIsThinkingSpinnerFrame:
+    """Tests for is_thinking_spinner_frame — detects thinking/tool-use spinners."""
+
+    def _feat(self, sync_count=1, cup_values=None, is_compact=False):
+        """Build a minimal feat dict."""
+        return {
+            'sync_count': sync_count,
+            'cup_values': cup_values if cup_values is not None else [],
+            'is_compact': is_compact,
+            'clear_count': 0,
+            'pane_id': -1,
+            'version': None,
+            'geom': None,
+            'ts': 1.0,
+        }
+
+    def test_returns_true_for_sync_large_cup_no_compact(self):
+        """sync_count>0, large CUP, no compact text → thinking spinner."""
+        feat = self._feat(sync_count=1, cup_values=[8], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is True
+
+    def test_returns_false_when_compact(self):
+        """Frames with compaction text are NOT thinking spinners."""
+        feat = self._feat(sync_count=1, cup_values=[8], is_compact=True)
+        assert is_thinking_spinner_frame(feat) is False
+
+    def test_returns_false_without_sync(self):
+        """Frames with no sync blocks are not thinking spinner frames."""
+        feat = self._feat(sync_count=0, cup_values=[8], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is False
+
+    def test_returns_false_without_large_cup(self):
+        """Frames without a large CUP value (≥6) are not thinking spinners."""
+        feat = self._feat(sync_count=1, cup_values=[3], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is False
+
+    def test_returns_false_with_no_cups(self):
+        """No cursor-up values → not a thinking spinner."""
+        feat = self._feat(sync_count=1, cup_values=[], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is False
+
+    def test_requires_large_cup_exactly_at_threshold(self):
+        """CUP=6 (the LARGE_CUP_MIN threshold) should count as large."""
+        feat = self._feat(sync_count=1, cup_values=[LARGE_CUP_MIN], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is True
+
+    def test_small_cup_only_not_thinking_spinner(self):
+        """Only small CUP values (≤5) present → not a thinking spinner."""
+        feat = self._feat(sync_count=1, cup_values=[3, 4, 5], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is False
+
+    def test_mixed_cups_qualifies_if_any_large(self):
+        """Mix of small and large CUP values → qualifies as thinking spinner."""
+        feat = self._feat(sync_count=1, cup_values=[3, 8], is_compact=False)
+        assert is_thinking_spinner_frame(feat) is True
+
+    def test_real_payload_thinking_frame(self):
+        """Frame with literal tmux sync + large CUP and no compaction text."""
+        frame = make_frame(b"\\033[?2026h\\033[8A Some output text...")
+        feat = extract_features(frame)
+        assert is_thinking_spinner_frame(feat) is True
+
+    def test_real_payload_compaction_frame_excluded(self):
+        """Frame with compaction text is excluded even if it has large CUP."""
+        frame = make_frame(b"\\033[?2026h\\033[8A Compacting context...")
+        feat = extract_features(frame)
+        assert is_thinking_spinner_frame(feat) is False
+
+
+# ── thinking_above in extract_event_metadata ──────────────────────────────────
+
+class TestThinkingMetadata:
+    """Tests for thinking_above and thinking_frame_offset in extract_event_metadata."""
+
+    def _build_window(self):
+        """Build a minimal window that satisfies flicker heuristics."""
+        return build_flicker_window()
+
+    def test_thinking_above_zero_when_no_history(self):
+        """thinking_above=0 when thinking_history is empty."""
+        w = self._build_window()
+        th = collections.deque(maxlen=COMPACT_LOOKBACK)
+        result = extract_event_metadata(w, collections.deque(), 0, th)
+        assert result['thinking_above'] == 0
+        assert result['thinking_frame_offset'] is None
+
+    def test_thinking_above_zero_when_history_is_none(self):
+        """thinking_above=0 when thinking_history argument is omitted (None)."""
+        w = self._build_window()
+        result = extract_event_metadata(w, collections.deque(), 0)
+        assert result['thinking_above'] == 0
+        assert result['thinking_frame_offset'] is None
+
+    def test_thinking_above_one_when_history_has_entry(self):
+        """thinking_above=1 when thinking_history contains a recent frame index."""
+        w = self._build_window()
+        th = collections.deque([5], maxlen=COMPACT_LOOKBACK)
+        result = extract_event_metadata(w, collections.deque(), 0, th)
+        assert result['thinking_above'] == 1
+
+    def test_thinking_frame_offset_computed(self):
+        """thinking_frame_offset is set when thinking_history has entries."""
+        w = self._build_window()
+        # Window starts at frame 0 (build_flicker_window assigns frame indices 0..N-1)
+        th = collections.deque([5, 10, 15], maxlen=COMPACT_LOOKBACK)
+        result = extract_event_metadata(w, collections.deque(), 0, th)
+        assert result['thinking_above'] == 1
+        assert result['thinking_frame_offset'] is not None
+
+    def test_thinking_and_compaction_independent(self):
+        """thinking_above and compaction_above can both be set independently."""
+        w = self._build_window()
+        ch = collections.deque([3], maxlen=COMPACT_LOOKBACK)
+        th = collections.deque([7], maxlen=COMPACT_LOOKBACK)
+        result = extract_event_metadata(w, ch, 0, th)
+        assert result['compaction_above'] == 1
+        assert result['thinking_above'] == 1
+
+    def test_result_keys_present(self):
+        """Both thinking_above and thinking_frame_offset are always in the result."""
+        w = self._build_window()
+        result = extract_event_metadata(w, collections.deque(), 0)
+        assert 'thinking_above' in result
+        assert 'thinking_frame_offset' in result
+
+
+# ── ensure_thinking_schema and backfill tests ──────────────────────────────────
+
+class TestThinkingSchema:
+    """Tests for ensure_thinking_schema and backfill_thinking_above."""
+
+    def _fresh_db(self) -> sqlite3.Connection:
+        conn = init_db(":memory:")
+        ensure_session_schema(conn)
+        return conn
+
+    def _insert_test_recording(self, conn) -> int:
+        return insert_recording(conn, {
+            'path': '/tmp/test.lz',
+            'file_size_bytes': 1000,
+            'frame_count': 100,
+            'duration_us': 10_000_000,
+            'start_ts_us': 1_000_000,
+            'end_ts_us': 11_000_000,
+            'claude_version': '2.1.34',
+            'has_compaction': 0,
+            'compaction_count': 0,
+            'flicker_count': 1,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+
+    def test_ensure_thinking_schema_idempotent(self):
+        """ensure_thinking_schema can be called multiple times without error."""
+        conn = self._fresh_db()
+        ensure_thinking_schema(conn)
+        ensure_thinking_schema(conn)
+        # Columns should exist (no exception when querying them)
+        conn.execute("SELECT thinking_above, thinking_frame_offset FROM flicker_events LIMIT 0")
+
+    def test_thinking_columns_present_in_fresh_db(self):
+        """init_db creates flicker_events with thinking_above column."""
+        conn = init_db(":memory:")
+        conn.execute("SELECT thinking_above, thinking_frame_offset FROM flicker_events LIMIT 0")
+
+    def test_insert_flicker_with_thinking_fields(self):
+        """insert_flicker stores thinking_above and thinking_frame_offset."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        insert_flicker(conn, rec_id, {
+            'start_frame': 20, 'end_frame': 50,
+            'start_ts_us': 2_000_000, 'end_ts_us': 5_000_000,
+            'duration_us': 3_000_000, 'frame_count': 30,
+            'frames_per_second': 10.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 5, 'line_clear_count': 0,
+            'thinking_above': 1, 'thinking_frame_offset': -2,
+        })
+        row = conn.execute(
+            "SELECT thinking_above, thinking_frame_offset FROM flicker_events WHERE recording_id = ?",
+            (rec_id,)
+        ).fetchone()
+        assert row[0] == 1
+        assert row[1] == -2
+
+    def test_insert_flicker_without_thinking_fields_stores_null(self):
+        """insert_flicker without thinking fields stores NULL (not yet backfilled)."""
+        conn = self._fresh_db()
+        rec_id = self._insert_test_recording(conn)
+        insert_flicker(conn, rec_id, {
+            'start_frame': 20, 'end_frame': 50,
+            'start_ts_us': 2_000_000, 'end_ts_us': 5_000_000,
+            'duration_us': 3_000_000, 'frame_count': 30,
+            'frames_per_second': 10.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 5, 'line_clear_count': 0,
+        })
+        row = conn.execute(
+            "SELECT thinking_above FROM flicker_events WHERE recording_id = ?",
+            (rec_id,)
+        ).fetchone()
+        assert row[0] is None  # NULL = not yet backfilled
+
+    def test_backfill_skips_missing_files(self):
+        """backfill_thinking_above records an error for non-existent files."""
+        conn = self._fresh_db()
+        rec_id = insert_recording(conn, {
+            'path': '/nonexistent/file.lz',
+            'file_size_bytes': 0, 'frame_count': 0, 'duration_us': 0,
+            'start_ts_us': 0, 'end_ts_us': 0, 'claude_version': None,
+            'has_compaction': 0, 'compaction_count': 0, 'flicker_count': 1,
+            'processed_at': '2025-01-01T00:00:00+00:00',
+        })
+        insert_flicker(conn, rec_id, {
+            'start_frame': 5, 'end_frame': 34,
+            'start_ts_us': 0, 'end_ts_us': 0,
+            'duration_us': 0, 'frame_count': 30,
+            'frames_per_second': 0.0,
+            'compaction_above': 0, 'compaction_frame_offset': None,
+            'cursor_up_rows': 3, 'cursor_up_spinner': 8,
+            'sync_block_count': 3, 'line_clear_count': 0,
+        })
+        stats = backfill_thinking_above(conn)
+        assert stats['errors'] == 1
+        assert stats['updated'] == 0
